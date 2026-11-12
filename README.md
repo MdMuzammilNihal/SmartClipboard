@@ -16,7 +16,7 @@ A local, privacy-focused smart clipboard for Windows. It watches what you copy, 
 | Logging that refuses clipboard content, with tests | Written and tested |
 | Clipboard listener (own thread, busy-retry, merging of repeated events) | Written; tested with a fake clipboard and real window messages. Not yet connected to storage, and not yet confirmed against real copies from other apps |
 | Content labeling by rules | Written and tested on made-up examples only; accuracy on real copies is not measured. Known mislabels are listed in `tests/test_classify.py` |
-| Secret flagging | Not started. Until it exists, a password-like token is labeled as a plain note |
+| Secret flagging by rules | Written and tested on made-up values only; thresholds are starting values, not measured. Known misses and false alarms are listed in `tests/test_secret_rules.py`. Not yet connected to capture |
 | Privacy controls (pause, exclusions, opt-out formats) | Not started |
 | Retention and duplicate merging | Not started |
 | Hotkey search window | Not started |
@@ -86,7 +86,9 @@ There are three outcomes rather than a yes or no:
 
 Missing a real secret is worse than a false alarm, so thresholds lean toward catching secrets. Thresholds live in config, not code.
 
-**Known weak spots.** Hashes, order IDs, UUIDs, and long random filenames look like passwords and will cause false alarms. Memorable weak passwords look like normal words and can be missed. Rule-based detection will make both kinds of mistake.
+"Clearly secret" means the text contains a known key format, or it scores high and was copied from an app on a list of login-type apps. That list is empty by default, so until you fill it, a random-looking password with no known format lands in "Unsure". Unsure items get the same short retention as secrets.
+
+**Known weak spots.** Hashes, order IDs, UUIDs, and file names look like passwords, so the rules deliberately ignore those shapes; a real secret that happens to look like one of them is missed. Passphrases made only of letters are missed. Product names and identifiers that mix cases and digits (`iPhone15Pro`, `user_1234`) can be flagged for review. Rule-based detection will make both kinds of mistake.
 
 ## Threat model
 
