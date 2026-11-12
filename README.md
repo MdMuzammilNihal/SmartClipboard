@@ -182,4 +182,4 @@ Phase 2 exists to replace "the detector works" with numbers. If the rules turn o
 
 ## License
 
-No license has been chosen yet. Until one is added, all rights are reserved.
+MIT. See [LICENSE](LICENSE).

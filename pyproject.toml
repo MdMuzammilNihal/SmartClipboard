@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "A privacy-focused smart clipboard for Windows. Not a password manager."
 readme = "README.md"
 requires-python = ">=3.11"
-# No license chosen yet. Until one is added, the code is all-rights-reserved.
+license = "MIT"
+license-files = ["LICENSE"]
 
 # Dependencies are pinned and deliberately few. The app must make no network
 # calls, so every addition needs a reason and a check of what it does.
