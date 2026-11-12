@@ -14,7 +14,7 @@ A local, privacy-focused smart clipboard for Windows. It watches what you copy, 
 | Test that fails if app code imports a networking module | Done |
 | Encrypted storage (DPAPI + SQLite), with tests | Written and tested; not yet connected to a listener |
 | Logging that refuses clipboard content, with tests | Written and tested |
-| Clipboard listener | Not started |
+| Clipboard listener (own thread, busy-retry, merging of repeated events) | Written; tested with a fake clipboard and real window messages. Not yet connected to storage, and not yet confirmed against real copies from other apps |
 | Content labeling and secret flagging | Not started |
 | Privacy controls (pause, exclusions, opt-out formats) | Not started |
 | Retention and duplicate merging | Not started |
