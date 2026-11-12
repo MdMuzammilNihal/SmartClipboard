@@ -8,11 +8,10 @@ version = "0.1.0"
 description = "A privacy-focused smart clipboard for Windows. Not a password manager."
 readme = "README.md"
 requires-python = ">=3.11"
-# No license chosen yet (owner decision, CLAUDE.md section 16 item 3).
-# Until one is added, the code is all-rights-reserved.
+# No license chosen yet. Until one is added, the code is all-rights-reserved.
 
-# Dependencies are pinned and limited to the set the owner approved
-# (CLAUDE.md section 16 item 12). Do not add any without asking.
+# Dependencies are pinned and deliberately few. The app must make no network
+# calls, so every addition needs a reason and a check of what it does.
 dependencies = [
     "pywin32==312",
 ]

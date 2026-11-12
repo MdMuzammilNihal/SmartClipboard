@@ -1,5 +1,5 @@
 # Smart Clipboard .gitignore
-# This file must be the first commit (CLAUDE.md section 11, pitfall 9).
+# Committed before any other file, so private data can never be tracked by accident.
 # The app keeps its real data under %LOCALAPPDATA%\SmartClipboard\, outside
 # the repo. The patterns below are a second line of defence in case a
 # database, log, or private file ever lands inside the working tree.

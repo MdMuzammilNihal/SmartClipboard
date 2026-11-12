@@ -2,8 +2,7 @@
 
 Not a password manager. See README.md for the threat model.
 
-Project-wide rules that every module in this package must follow
-(CLAUDE.md section 2):
+Project-wide rules that every module in this package must follow:
 
 - Clipboard content is never logged, printed, or written anywhere except the
   DPAPI-encrypted database. Logs may hold IDs, content types, lengths, and

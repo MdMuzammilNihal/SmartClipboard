@@ -1,4 +1,4 @@
-"""No-network check (CLAUDE.md section 13, task 13).
+"""No-network check.
 
 Fails if any module in the app package imports a networking module.
 
