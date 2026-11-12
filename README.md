@@ -12,8 +12,9 @@ A local, privacy-focused smart clipboard for Windows. It watches what you copy, 
 |---|---|
 | Repository, pinned dependencies, package skeleton | Done |
 | Test that fails if app code imports a networking module | Done |
+| Encrypted storage (DPAPI + SQLite), with tests | Written and tested; not yet connected to a listener |
+| Logging that refuses clipboard content, with tests | Written and tested |
 | Clipboard listener | Not started |
-| Encrypted storage | Not started |
 | Content labeling and secret flagging | Not started |
 | Privacy controls (pause, exclusions, opt-out formats) | Not started |
 | Retention and duplicate merging | Not started |
@@ -99,7 +100,8 @@ Stored items are encrypted with Windows DPAPI (`CryptProtectData`). No custom cr
 Other limits you should know:
 
 - **Data is tied to your Windows account.** A profile reset, or moving the database to another PC, makes it unreadable. There is no recovery.
-- **Some metadata stays visible.** Each row's ID and creation time are stored in plaintext, so someone with the file can see how many items exist and when they were saved. Content, labels, source app, and flags are inside the encrypted payload.
+- **Some metadata stays visible.** Each row's ID and creation time are stored in plaintext, so someone with the file can see how many items exist and when they were saved. The size of each encrypted payload is also visible, which roughly reveals how long the copied text was. Content, labels, source app, and flags are inside the encrypted payload.
+- **Deleted rows are overwritten in the database file** (SQLite's `secure_delete`). This does not control copies the disk or Windows may keep elsewhere, such as SSD wear levelling, backups, or shadow copies.
 - **Secrets cannot be reliably wiped from memory.** Python gives no dependable way to erase a string from RAM. While the app runs, decrypted items are in memory so search can work.
 - **The Windows opt-out formats are cooperative.** Windows documents three clipboard formats for keeping data out of history and cloud sync: `ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory`, and `CanUploadToCloudClipboard`. This app honors them when watching and sets them when copying a secret back. Another clipboard manager is free to ignore them, so they are a courtesy, not a guarantee.
 - **Password managers are skipped only if they cooperate, or if you exclude them.** A password manager that does not set the opt-out formats will be captured unless you add it to the exclusion list. The default exclusion list is empty.
@@ -108,7 +110,7 @@ Other limits you should know:
 ## Privacy rules the code follows
 
 - **No network access.** No cloud APIs, telemetry, update checks, or analytics. A test fails if app code imports a networking module. That test is a static check of this project's own import statements: it does not catch dynamic imports and does not inspect what third-party dependencies do internally, so it is a guard against accidents, not proof.
-- **Clipboard content is never logged.** Logs may contain IDs, content types, lengths, and timestamps only. This includes error messages and crash output.
+- **Clipboard content is never logged.** Logs may contain IDs, content types, lengths, and timestamps only. This includes error messages and crash output. The logging module enforces this: it refuses free-text values, discards ordinary logging calls, and records only the class name of an exception, never its message. It cannot stop a stray `print()` or control what third-party libraries print.
 - **Only app names are stored as context,** never window titles.
 - **Tests use fake data only.**
 - **Pause mode** stops capture entirely, with a visible indicator.
