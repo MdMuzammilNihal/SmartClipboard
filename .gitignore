@@ -55,3 +55,6 @@ desktop.ini
 CLAUDE.md
 PHASE2.md
 .claude/settings.local.json
+
+# --- Owner's personal tracker spreadsheets ---
+docs/*.xlsx
