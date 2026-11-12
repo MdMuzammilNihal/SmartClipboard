@@ -51,5 +51,7 @@ htmlcov/
 Thumbs.db
 desktop.ini
 
-# --- Claude Code local settings ---
+# --- Claude Code planning files and local settings (kept on the owner's machine only) ---
+CLAUDE.md
+PHASE2.md
 .claude/settings.local.json

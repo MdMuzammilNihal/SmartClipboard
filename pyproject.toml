@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smart-clipboard"
+version = "0.1.0"
+description = "A privacy-focused smart clipboard for Windows. Not a password manager."
+readme = "README.md"
+requires-python = ">=3.11"
+# No license chosen yet (owner decision, CLAUDE.md section 16 item 3).
+# Until one is added, the code is all-rights-reserved.
+
+# Dependencies are pinned and limited to the set the owner approved
+# (CLAUDE.md section 16 item 12). Do not add any without asking.
+dependencies = [
+    "pywin32==312",
+]
+
+[project.optional-dependencies]
+# PySide6 is an approved runtime dependency. It sits in its own group only so
+# the foundation work (listener, storage, classifier) does not need the large
+# Qt install. It moves into `dependencies` when the UI work starts.
+ui = [
+    "PySide6==6.12.0",
+]
+dev = [
+    "pytest==9.2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Lets the tests import `smartclip` from src/ without installing the package.
+pythonpath = ["src"]
