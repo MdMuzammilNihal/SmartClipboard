@@ -45,6 +45,12 @@ SECURITY REVIEW (owner):
   - If the owner lookup fails, the write is not recognised as ours and is
     captured; duplicate merging (task 8) would then fold it into the
     existing item.
+- Force-save (task 11, Ctrl+Alt+F) uses skip_forced(), which overrides
+  pause and the exclusion list only (owner's decision, 2026-11-18). It still
+  refuses content carrying the opt-out formats, because a password manager
+  asked for that, and our own writes, which are stored already. A forced
+  read happens only when the owner presses the hotkey, and even while
+  paused it opens the clipboard for that one read.
 - Logs record why a change was skipped, never the text, the app name, or a
   window title.
 
@@ -202,11 +208,21 @@ class Gate:
         Call with the clipboard open, after looking up the source app, and
         before reading the text.
         """
-        if source.owner_process_id == self.own_process_id:
-            return SkipReason.OWN_WRITE
-        opt_out = formats.skip_reason(clipboard)
-        if opt_out is not None:
-            return opt_out
+        forced_skip = self.skip_forced(clipboard, formats, source)
+        if forced_skip is not None:
+            return forced_skip
         if source.name is not None and exe_name(source.name) in self._excluded_apps:
             return SkipReason.EXCLUDED_APP
         return None
+
+    def skip_forced(
+        self, clipboard: FormatReader, formats: OptOutFormats, source: SourceApp
+    ) -> SkipReason | None:
+        """The checks force-save still obeys: own writes and opt-out formats.
+
+        Pause and the exclusion list are deliberately not checked here.
+        Call with the clipboard open, before reading the text.
+        """
+        if source.owner_process_id == self.own_process_id:
+            return SkipReason.OWN_WRITE
+        return formats.skip_reason(clipboard)

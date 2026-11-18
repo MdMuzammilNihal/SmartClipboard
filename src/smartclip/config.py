@@ -7,6 +7,7 @@ is tied to this Windows account on this PC and is unreadable anywhere else.
 
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 
 APP_DIR_NAME = "SmartClipboard"
@@ -41,6 +42,15 @@ LOGIN_SOURCE_APPS: frozenset[str] = frozenset()
 # the owner adds apps; real process names must be checked on the owner's
 # machine first. The settings screen will edit this later.
 EXCLUDED_APPS: frozenset[str] = frozenset()
+
+# How long secrets and unsure items are kept (owner's decision: 2 hours).
+SECRET_RETENTION = timedelta(hours=2)
+
+# Global hotkeys (owner's decisions, 2026-11-12 and 2026-11-18). Not yet
+# tested for clashes with other apps. Opening the window (Ctrl+Alt+V) and the
+# pause toggle (Ctrl+Alt+P) are registered when the UI exists.
+HOTKEY_MARK_SECRET = "Ctrl+Alt+S"
+HOTKEY_FORCE_SAVE = "Ctrl+Alt+F"
 
 
 def app_data_dir() -> Path:

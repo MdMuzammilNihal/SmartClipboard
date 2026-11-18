@@ -17,7 +17,10 @@ How it works:
    (sourceapp.py), and lets the gate check for our own writes, the Windows
    opt-out formats, and the exclusion list. Only if the gate allows it is
    the text taken. Non-text content is ignored.
-4. The result is put on a queue. The listener never touches the UI or the
+4. Force-save (task 11): request_force_save() asks the listener thread to
+   read what is on the clipboard now, overriding pause and the exclusion
+   list but not the opt-out formats or our own writes (gate.skip_forced).
+5. The result is put on a queue. The listener never touches the UI or the
    database; whoever owns the queue does that on their own thread.
 
 SECURITY REVIEW (owner):
@@ -70,6 +73,8 @@ from smartclip.sourceapp import (
 )
 
 WM_CLIPBOARDUPDATE = 0x031D
+# Our own message asking the listener thread for a force-save read.
+WM_FORCE_SAVE = win32con.WM_APP + 1
 
 # How long to wait after the last change message before reading. Long enough
 # to merge the messages from one copy, short enough to feel instant.
@@ -115,6 +120,8 @@ class ClipboardEvent:
     # Lower-case executable name, a best guess (see sourceapp.py).
     source_app: str | None = None
     source_method: SourceMethod = SourceMethod.UNKNOWN
+    # True when the owner force-saved it with the hotkey.
+    forced: bool = False
 
 
 class ClipboardApi(FormatReader, Protocol):
@@ -199,6 +206,9 @@ class ClipboardReader:
         self._delay_seconds = delay_seconds
         self._sleep = sleep
         self._last_sequence: int | None = None
+        # The latest change that was actually captured, so force-save does not
+        # store the same copy twice.
+        self._last_captured_sequence: int | None = None
         # The window the clipboard is opened for. The listener sets this to
         # its hidden window. Seen on Windows 11 (owner's machine, 2026-11-18):
         # with no window (None), OpenClipboard reported success on the
@@ -214,6 +224,18 @@ class ClipboardReader:
         if skip is not None:
             _log_skip(skip, sequence=None)
             return None
+        return self._read(forced=False)
+
+    def read_forced(self) -> ClipboardEvent | None:
+        """Force-save: capture what the clipboard holds now, if allowed.
+
+        Overrides pause and the exclusion list. Still refuses our own writes,
+        the opt-out formats, and a change that was already captured.
+        """
+        return self._read(forced=True)
+
+    def _read(self, forced: bool) -> ClipboardEvent | None:
+        """Open the clipboard, run the gate, and take the text if allowed."""
         if not self._open_with_retry():
             logsafe.log_event(
                 _log, "clipboard_busy", level=logging.WARNING, attempts=self._attempts
@@ -224,10 +246,16 @@ class ClipboardReader:
             # change the clipboard until we close it, so the counter and the
             # text are guaranteed to belong together.
             sequence = self._api.sequence_number()
-            if sequence == self._last_sequence:
+            if forced and sequence == self._last_captured_sequence:
+                logsafe.log_event(_log, "force_save_already_captured", sequence=sequence)
+                return None
+            if not forced and sequence == self._last_sequence:
                 return None
             source = self._find_source()
-            skip = self._gate.skip_while_open(self._api, self._formats, source)
+            if forced:
+                skip = self._gate.skip_forced(self._api, self._formats, source)
+            else:
+                skip = self._gate.skip_while_open(self._api, self._formats, source)
             # A refused change is never read.
             text = self._api.get_text() if skip is None else None
             self._last_sequence = sequence
@@ -235,11 +263,12 @@ class ClipboardReader:
             self._api.close()
 
         if skip is not None:
-            _log_skip(skip, sequence=sequence)
+            _log_skip(skip, sequence=sequence, forced=forced)
             return None
         if not text:
             logsafe.log_event(_log, "clipboard_skipped_no_text", sequence=sequence)
             return None
+        self._last_captured_sequence = sequence
         logsafe.log_event(
             _log,
             "clipboard_captured",
@@ -247,6 +276,7 @@ class ClipboardReader:
             sequence=sequence,
             source_known=source.name is not None,
             source_from_owner=source.method is SourceMethod.CLIPBOARD_OWNER,
+            forced=forced,
         )
         return ClipboardEvent(
             text=text,
@@ -254,6 +284,7 @@ class ClipboardReader:
             captured_at=datetime.now(timezone.utc),
             source_app=source.name,
             source_method=source.method,
+            forced=forced,
         )
 
     def _find_source(self) -> SourceApp:
@@ -276,9 +307,10 @@ class ClipboardReader:
         return False
 
 
-def _log_skip(reason: SkipReason, sequence: int | None) -> None:
+def _log_skip(reason: SkipReason, sequence: int | None, forced: bool = False) -> None:
     """Log why a change was refused. The event name comes from the enum."""
-    logsafe.log_event(_log, f"clipboard_skipped_{reason.value}", sequence=sequence)
+    prefix = "force_save_refused" if forced else "clipboard_skipped"
+    logsafe.log_event(_log, f"{prefix}_{reason.value}", sequence=sequence)
 
 
 class ClipboardListener:
@@ -325,6 +357,23 @@ class ClipboardListener:
         if not started or self._start_failed:
             self._thread = None
             raise ListenerError("clipboard listener could not start")
+
+    def request_force_save(self) -> bool:
+        """Ask the listener thread to force-save the current clipboard.
+
+        Safe to call from any thread (for example the hotkey thread). The
+        read happens on the listener thread and its result, if any, goes on
+        the queue with forced=True. Returns False if the listener is not
+        running.
+        """
+        hwnd = self._hwnd
+        if hwnd is None:
+            return False
+        try:
+            win32gui.PostMessage(hwnd, WM_FORCE_SAVE, 0, 0)
+        except pywintypes.error:
+            return False
+        return True
 
     def stop(self) -> None:
         """Ask the listener thread to finish and wait for it."""
@@ -380,6 +429,7 @@ class ClipboardListener:
         window_class.lpfnWndProc = {
             WM_CLIPBOARDUPDATE: self._on_update,
             win32con.WM_TIMER: self._on_timer,
+            WM_FORCE_SAVE: self._on_force_save,
             win32con.WM_DESTROY: self._on_destroy,
         }
         atom = win32gui.RegisterClass(window_class)
@@ -409,6 +459,16 @@ class ClipboardListener:
                 self._events.put(event)
         except Exception as error:  # noqa: BLE001 - see SECURITY REVIEW above
             logsafe.log_error(_log, "capture_failed", error)
+        return 0
+
+    def _on_force_save(self, _hwnd: int, _message: int, _wparam: int, _lparam: int) -> int:
+        """The force-save hotkey was pressed: read once, overriding pause."""
+        try:
+            event = self._reader.read_forced()
+            if event is not None:
+                self._events.put(event)
+        except Exception as error:  # noqa: BLE001 - see SECURITY REVIEW above
+            logsafe.log_error(_log, "force_save_failed", error)
         return 0
 
     def _on_destroy(self, hwnd: int, _message: int, _wparam: int, _lparam: int) -> int:

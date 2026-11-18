@@ -18,6 +18,7 @@ A local, privacy-focused smart clipboard for Windows. It watches what you copy, 
 | Content labeling by rules | Written and tested on made-up examples only; accuracy on real copies is not measured. Known mislabels are listed in `tests/test_classify.py` |
 | Secret flagging by rules | Written and tested on made-up values only; thresholds are starting values, not measured. Known misses and false alarms are listed in `tests/test_secret_rules.py`. Not yet connected to capture |
 | Privacy gate (pause, app exclusion list, Windows opt-out formats, ignoring the app's own writes) | Written and tested with a fake clipboard; opt-out formats and own-write skipping also pass opt-in real-clipboard tests with fake text. Pause has no hotkey or tray toggle yet (comes with the UI). Not yet checked against a real password manager |
+| Manual overrides: force-save and mark-as-secret hotkeys | Hotkey registration, force-save, and the mark-as-secret rule are written and tested (force-save also on the real clipboard with fake text). Not usable yet: storage and the hotkeys are not connected to the app. Real key presses are untested |
 | Source-app detection (clipboard owner, foreground window as fallback) | Written and tested with fake window lookups; how often it names the right app is not measured yet |
 | Retention and duplicate merging | Not started |
 | Hotkey search window | Not started |
@@ -140,8 +141,12 @@ Other limits you should know:
 | Open the search window | `Ctrl+Alt+V` |
 | Pause or resume capture | `Ctrl+Alt+P` |
 | Mark the last item as secret | `Ctrl+Alt+S` |
+| Force-save what is on the clipboard now | `Ctrl+Alt+F` |
 
-These are configurable. They have not yet been tested for clashes with other apps.
+These are configurable. They have not yet been tested for clashes with other apps; if another app already holds a combination, it is reported instead of taken over.
+
+- **Mark as secret** always marks secret, never back to normal, so a second press cannot undo a detection. It applies only while the clipboard still holds that item. Marking an item normal will be done in the window.
+- **Force-save** captures the current clipboard even while capture is paused or the app is excluded. It still refuses content a password manager marked with the Windows opt-out formats.
 
 ## Out of scope for this version
 

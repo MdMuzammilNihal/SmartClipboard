@@ -455,6 +455,102 @@ def test_skips_are_logged_by_reason_only(log_output: io.StringIO) -> None:
     assert "dropped_fields" not in text
 
 
+# --- Force-save: overrides pause and exclusions, nothing else ---
+
+
+def test_force_save_overrides_pause() -> None:
+    api = FakeClipboard()
+    gate = Gate(pause=PauseSwitch(paused=True))
+    event = make_reader(api, gate).read_forced()
+    assert event is not None
+    assert event.text == FAKE_TEXT and event.forced is True
+
+
+def test_force_save_overrides_the_exclusion_list() -> None:
+    api = FakeClipboard()
+    gate = Gate(excluded_apps=[FAKE_APP])
+    reader = make_reader(api, gate)
+    assert reader.read_new() is None  # skipped as an excluded app
+    event = reader.read_forced()
+    assert event is not None and event.forced is True
+
+
+@pytest.mark.parametrize(
+    ("name", "data"),
+    [(EXCLUDE_FROM_MONITOR_FORMAT, b"\x00"), (CAN_INCLUDE_IN_HISTORY_FORMAT, DWORD_ZERO)],
+)
+def test_force_save_still_refuses_opt_out_formats(name: str, data: bytes) -> None:
+    api = FakeClipboard()
+    api.set_format(name, data)
+    gate = Gate(pause=PauseSwitch(paused=True), excluded_apps=[FAKE_APP])
+    assert make_reader(api, gate).read_forced() is None
+    assert api.text_reads == 0
+
+
+def test_force_save_still_refuses_our_own_writes() -> None:
+    api = FakeClipboard()
+    gate = Gate(own_process_id=FAKE_OWNER_PID)
+    assert make_reader(api, gate).read_forced() is None
+    assert api.text_reads == 0
+
+
+def test_force_save_does_not_store_a_copy_twice() -> None:
+    api = FakeClipboard(sequence=9)
+    reader = make_reader(api)
+    assert reader.read_new() is not None
+    assert reader.read_forced() is None
+    assert api.text_reads == 1
+
+
+def test_normal_read_does_not_repeat_a_force_saved_copy() -> None:
+    api = FakeClipboard(sequence=9)
+    gate = Gate(pause=PauseSwitch(paused=True))
+    reader = make_reader(api, gate)
+    assert reader.read_forced() is not None
+    gate.pause.resume()
+    assert reader.read_new() is None
+
+
+def test_force_save_works_again_for_a_new_copy() -> None:
+    api = FakeClipboard(sequence=9)
+    gate = Gate(pause=PauseSwitch(paused=True))
+    reader = make_reader(api, gate)
+    assert reader.read_forced() is not None
+    api.sequence = 10
+    assert reader.read_forced() is not None
+
+
+def test_force_save_logs_reasons_only(log_output: io.StringIO) -> None:
+    api = FakeClipboard(sequence=3)
+    api.set_format(EXCLUDE_FROM_MONITOR_FORMAT, b"\x00")
+    gate = Gate(pause=PauseSwitch(paused=True), excluded_apps=[FAKE_APP])
+    reader = make_reader(api, gate)
+    reader.read_forced()
+    api.formats.clear()
+    reader.read_forced()
+    reader.read_forced()
+    text = log_output.getvalue()
+    assert "force_save_refused_opt_out_monitor sequence=3" in text
+    assert "clipboard_captured" in text and "forced=true" in text
+    assert "force_save_already_captured sequence=3" in text
+    assert FAKE_TEXT not in text and FAKE_APP not in text
+
+
+def test_listener_force_save_request_while_paused() -> None:
+    events: "queue.Queue[ClipboardEvent]" = queue.Queue()
+    api = FakeClipboard()
+    listener = ClipboardListener(events, api=api, windows=FakeWindows(), debounce_ms=20)
+    listener.gate.pause.pause()
+    assert listener.request_force_save() is False  # not running yet
+    listener.start()
+    try:
+        assert listener.request_force_save() is True
+        event = events.get(timeout=3)
+    finally:
+        listener.stop()
+    assert event.forced is True and event.text == FAKE_TEXT
+
+
 # --- The real listener thread, fake clipboard behind it ---
 
 
@@ -563,3 +659,21 @@ def test_real_opt_out_formats_are_honoured(extra: dict[str, bytes]) -> None:
     finally:
         listener.stop()
         _empty_real()
+
+
+@real_clipboard
+def test_real_force_save_while_paused() -> None:
+    events: "queue.Queue[ClipboardEvent]" = queue.Queue()
+    listener = ClipboardListener(events)
+    listener.gate.pause.pause()
+    listener.start()
+    try:
+        _write_real(FAKE_TEXT)
+        time.sleep(0.5)
+        assert events.empty()
+        assert listener.request_force_save()
+        event = events.get(timeout=3)
+    finally:
+        listener.stop()
+        _empty_real()
+    assert event.text == FAKE_TEXT and event.forced is True

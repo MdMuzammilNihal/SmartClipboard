@@ -445,3 +445,42 @@ def test_real_copies_in_a_row_are_all_captured(
             win32clipboard.EmptyClipboard()
         finally:
             win32clipboard.CloseClipboard()
+
+
+@pytest.mark.skipif(
+    os.environ.get("SMARTCLIP_REAL_CLIPBOARD_TESTS") != "1",
+    reason="replaces the real clipboard; set SMARTCLIP_REAL_CLIPBOARD_TESTS=1 to run",
+)
+@pytest.mark.parametrize(
+    ("clipboard_format", "data"),
+    [
+        (win32con.CF_UNICODETEXT, FAKE_TEXT),
+        # Only ANSI text: Windows converts it when we ask for Unicode.
+        (win32con.CF_TEXT, FAKE_TEXT.encode("ascii")),
+    ],
+)
+def test_real_read_leaves_the_sequence_number_unchanged(
+    events: "queue.Queue[ClipboardEvent]", clipboard_format: int, data: str | bytes
+) -> None:
+    # Mark-as-secret (overrides.LastCapture) relies on this: the number on a
+    # captured event must still be the clipboard's number after we read it.
+    listener = ClipboardListener(events)
+    listener.start()
+    try:
+        win32clipboard.OpenClipboard(None)
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(clipboard_format, data)
+        finally:
+            win32clipboard.CloseClipboard()
+        event = events.get(timeout=3)
+        time.sleep(0.2)
+        assert event.text == FAKE_TEXT
+        assert event.sequence_number == win32clipboard.GetClipboardSequenceNumber()
+    finally:
+        listener.stop()
+        win32clipboard.OpenClipboard(None)
+        try:
+            win32clipboard.EmptyClipboard()
+        finally:
+            win32clipboard.CloseClipboard()
