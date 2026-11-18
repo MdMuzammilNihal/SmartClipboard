@@ -22,6 +22,9 @@ How it works:
    list but not the opt-out formats or our own writes (gate.skip_forced).
 5. The result is put on a queue. The listener never touches the UI or the
    database; whoever owns the queue does that on their own thread.
+6. Copy-back (task 12): request_copy_back() asks the listener thread to
+   write an item back to the clipboard for the listener's own window, and
+   for a secret, to clear it again later (copyback.py).
 
 SECURITY REVIEW (owner):
 
@@ -50,6 +53,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Future
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -62,6 +66,7 @@ import win32con
 import win32gui
 
 from smartclip import logsafe
+from smartclip.copyback import ClearOutcome, CopyBack
 from smartclip.gate import FormatReader, Gate, OptOutFormats, SkipReason
 from smartclip.sourceapp import (
     UNKNOWN_SOURCE,
@@ -75,6 +80,8 @@ from smartclip.sourceapp import (
 WM_CLIPBOARDUPDATE = 0x031D
 # Our own message asking the listener thread for a force-save read.
 WM_FORCE_SAVE = win32con.WM_APP + 1
+# Our own message asking the listener thread to run queued copy-backs.
+WM_COPY_BACK = win32con.WM_APP + 2
 
 # How long to wait after the last change message before reading. Long enough
 # to merge the messages from one copy, short enough to feel instant.
@@ -85,6 +92,12 @@ OPEN_ATTEMPTS = 5
 RETRY_DELAY_SECONDS = 0.02
 
 _TIMER_ID = 1
+# Timer for clearing a secret after copy-back.
+_CLEAR_TIMER_ID = 2
+# If the clipboard is busy when the clear is due, try again this often, at
+# most this many times, before giving up.
+CLEAR_RETRY_MS = 1000
+CLEAR_RETRY_LIMIT = 5
 _START_TIMEOUT_SECONDS = 5.0
 _STOP_TIMEOUT_SECONDS = 5.0
 
@@ -323,11 +336,15 @@ class ClipboardListener:
         gate: Gate | None = None,
         windows: WindowApi | None = None,
         debounce_ms: int = DEBOUNCE_MS,
+        copy_back: CopyBack | None = None,
     ) -> None:
         self._events = events
         self.gate = gate or Gate()
         self._reader = ClipboardReader(api or Win32Clipboard(), self.gate, windows)
         self._debounce_ms = debounce_ms
+        self._copy_back = copy_back or CopyBack()
+        self._copy_requests: "queue.Queue[tuple[str, bool, Future[bool]]]" = queue.Queue()
+        self._clear_retries = 0
         self._thread: threading.Thread | None = None
         self._hwnd: int | None = None
         self._ready = threading.Event()
@@ -374,6 +391,29 @@ class ClipboardListener:
         except pywintypes.error:
             return False
         return True
+
+    def request_copy_back(self, text: str, sensitive: bool) -> "Future[bool] | None":
+        """Ask the listener thread to put text back on the clipboard.
+
+        Safe to call from any thread. With sensitive=True (secret and unsure
+        items) the write carries the opt-out formats and is cleared after
+        `config.COPYBACK_CLEAR_AFTER`. Never waits: the returned future
+        becomes True once written, or False if the clipboard stayed busy.
+        Returns None if the listener is not running.
+        """
+        hwnd = self._hwnd
+        if hwnd is None:
+            return None
+        future: Future[bool] = Future()
+        self._copy_requests.put((text, sensitive, future))
+        try:
+            win32gui.PostMessage(hwnd, WM_COPY_BACK, 0, 0)
+        except pywintypes.error:
+            # The request stays queued but is skipped when next seen, so a
+            # stale copy-back can never happen later by surprise.
+            future.cancel()
+            return None
+        return future
 
     def stop(self) -> None:
         """Ask the listener thread to finish and wait for it."""
@@ -430,6 +470,7 @@ class ClipboardListener:
             WM_CLIPBOARDUPDATE: self._on_update,
             win32con.WM_TIMER: self._on_timer,
             WM_FORCE_SAVE: self._on_force_save,
+            WM_COPY_BACK: self._on_copy_back,
             win32con.WM_DESTROY: self._on_destroy,
         }
         atom = win32gui.RegisterClass(window_class)
@@ -450,8 +491,11 @@ class ClipboardListener:
         _user32.SetTimer(hwnd, _TIMER_ID, self._debounce_ms, None)
         return 0
 
-    def _on_timer(self, hwnd: int, _message: int, _wparam: int, _lparam: int) -> int:
-        """The burst is over: read the clipboard once and queue the result."""
+    def _on_timer(self, hwnd: int, _message: int, wparam: int, _lparam: int) -> int:
+        """A timer fired: the copy-back clear, or the end of a burst of changes."""
+        if wparam == _CLEAR_TIMER_ID:
+            return self._on_clear_timer(hwnd)
+        # The burst is over: read the clipboard once and queue the result.
         _user32.KillTimer(hwnd, _TIMER_ID)
         try:
             event = self._reader.read_new()
@@ -471,9 +515,53 @@ class ClipboardListener:
             logsafe.log_error(_log, "force_save_failed", error)
         return 0
 
+    def _on_copy_back(self, hwnd: int, _message: int, _wparam: int, _lparam: int) -> int:
+        """Run every queued copy-back request, oldest first."""
+        while True:
+            try:
+                text, sensitive, future = self._copy_requests.get_nowait()
+            except queue.Empty:
+                return 0
+            if not future.set_running_or_notify_cancel():
+                continue  # cancelled because the request could not be posted
+            written = False
+            try:
+                written = self._copy_back.write(hwnd, text, sensitive)
+                if written and sensitive:
+                    self._clear_retries = 0
+                    clear_ms = int(self._copy_back.clear_after.total_seconds() * 1000)
+                    _user32.SetTimer(hwnd, _CLEAR_TIMER_ID, clear_ms, None)
+                elif written:
+                    _user32.KillTimer(hwnd, _CLEAR_TIMER_ID)
+            except Exception as error:  # noqa: BLE001 - see SECURITY REVIEW above
+                logsafe.log_error(_log, "copy_back_failed", error)
+            finally:
+                future.set_result(written)
+
+    def _on_clear_timer(self, hwnd: int) -> int:
+        """The copy-back time is up: clear the secret if it is still ours."""
+        _user32.KillTimer(hwnd, _CLEAR_TIMER_ID)
+        try:
+            outcome = self._copy_back.clear_if_ours(hwnd)
+            if outcome is ClearOutcome.BUSY:
+                self._clear_retries += 1
+                if self._clear_retries < CLEAR_RETRY_LIMIT:
+                    _user32.SetTimer(hwnd, _CLEAR_TIMER_ID, CLEAR_RETRY_MS, None)
+                else:
+                    self._copy_back.give_up_clear()
+        except Exception as error:  # noqa: BLE001 - see SECURITY REVIEW above
+            logsafe.log_error(_log, "copy_back_clear_failed", error)
+        return 0
+
     def _on_destroy(self, hwnd: int, _message: int, _wparam: int, _lparam: int) -> int:
-        """The window is closing: unregister and end the message loop."""
+        """The window is closing: clear a pending secret, unregister, end the loop."""
         _user32.KillTimer(hwnd, _TIMER_ID)
+        _user32.KillTimer(hwnd, _CLEAR_TIMER_ID)
+        try:
+            # Do not leave a secret on the clipboard after the app is gone.
+            self._copy_back.clear_if_ours(hwnd)
+        except Exception as error:  # noqa: BLE001 - see SECURITY REVIEW above
+            logsafe.log_error(_log, "copy_back_clear_failed", error)
         _user32.RemoveClipboardFormatListener(hwnd)
         win32gui.PostQuitMessage(0)
         return 0

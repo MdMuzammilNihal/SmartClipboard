@@ -22,7 +22,7 @@ A local, privacy-focused smart clipboard for Windows. It watches what you copy, 
 | Source-app detection (clipboard owner, foreground window as fallback) | Written and tested with fake window lookups; how often it names the right app is not measured yet |
 | Retention, duplicate merging, and pin rules | Written and tested with fake data on a temporary database: duplicates merge through a keyed hash and move to the top; normal items expire 90 days after the last copy; secrets and unsure items 2 hours after the first copy (copying again does not extend it); pinned normal items are kept; secrets and unsure items cannot be pinned. Not yet connected to the listener or run against real use |
 | Hotkey search window | Not started |
-| Safe copy-back for secrets | Not started |
+| Safe copy-back for secrets | Written; tested with a fake clipboard and real window messages. Opt-in tests that write fake text to the real clipboard pass on the owner's Windows 11 machine (opt-out formats set, own write not captured, cleared after the delay, a newer copy left alone). Not yet checked that Win+V history and cloud sync really leave the item out. Nothing calls it yet (the window is not built) |
 
 This table is updated as work lands.
 
@@ -111,6 +111,7 @@ Other limits you should know:
 - **The Windows opt-out formats are cooperative.** Windows documents three clipboard formats for keeping data out of history and cloud sync: `ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory`, and `CanUploadToCloudClipboard`. This app honors them when watching and sets them when copying a secret back. Another clipboard manager is free to ignore them, so they are a courtesy, not a guarantee.
 - **Password managers are skipped only if they cooperate, or if you exclude them.** A password manager that does not set the opt-out formats will be captured unless you add it to the exclusion list. The default exclusion list is empty.
 - **Source-app detection is a best guess.** The app asks Windows which program owns the clipboard and falls back to the foreground window. Either can be wrong.
+- **Copy-back of a secret is cleared after about 30 seconds, only if it is still on the clipboard.** "Still there" means this app's window still owns the clipboard: any other app that copies takes ownership, so a newer copy is never wiped. An app that adds data without emptying the clipboard first (unusual) would be cleared along with the secret. If the clipboard is busy, the clear is retried for a few seconds and then given up. Quitting the app clears a pending secret at once. During those 30 seconds, a clipboard manager that ignores the opt-out formats can still record it. Unsure items are copied back the same way.
 - **The app's own clipboard writes are recognised by the clipboard owner.** If the clipboard is owned by one of this app's windows, the change is not captured. This includes copying text inside the app's own window.
 
 ## Privacy rules the code follows

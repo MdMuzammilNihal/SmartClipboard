@@ -54,6 +54,10 @@ SECRET_RETENTION = timedelta(hours=2)
 # normal items are never deleted by retention.
 NORMAL_RETENTION = timedelta(days=90)
 
+# How long a secret or unsure item stays on the clipboard after copy-back
+# before it is cleared (CLAUDE.md section 9: "about 30 seconds").
+COPYBACK_CLEAR_AFTER = timedelta(seconds=30)
+
 # The shortest time between two VACUUM runs. A starting value, not measured:
 # VACUUM rewrites the whole file, so it should not run after every cleanup.
 VACUUM_INTERVAL = timedelta(days=1)
