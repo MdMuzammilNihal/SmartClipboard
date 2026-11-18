@@ -6,10 +6,11 @@ or saved: only its length and Windows' clipboard sequence number are shown.
 
     .\\.venv\\Scripts\\python.exe tools\\watch_clipboard.py
 
-WARNING: pause mode, the app exclusion list, and the password-manager opt-out
-formats are not implemented yet. This tool keeps each copied text in memory
-for a moment and then discards it, but do not copy real passwords while it
-runs.
+WARNING: the privacy gate is active (it honours the Windows opt-out formats
+that some password managers set), but the app exclusion list is empty and
+the gate has not been checked against a real password manager yet. This
+tool keeps each copied text in memory for a moment and then discards it,
+but do not copy real passwords while it runs.
 """
 
 import logging

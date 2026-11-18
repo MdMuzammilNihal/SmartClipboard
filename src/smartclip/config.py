@@ -36,6 +36,12 @@ SECRET_THRESHOLDS = SecretThresholds()
 # login-type sources. Empty until the owner chooses which apps belong here.
 LOGIN_SOURCE_APPS: frozenset[str] = frozenset()
 
+# Apps whose copies are never captured, by executable name (compared in lower
+# case, for example "fakemanager.exe"). Empty by the owner's decision until
+# the owner adds apps; real process names must be checked on the owner's
+# machine first. The settings screen will edit this later.
+EXCLUDED_APPS: frozenset[str] = frozenset()
+
 
 def app_data_dir() -> Path:
     """Return the app's data folder. Does not create it."""

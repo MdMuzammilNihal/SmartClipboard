@@ -10,23 +10,29 @@ How it works:
    formats in more than one step). Each message restarts a short timer, and
    the clipboard is read only when the timer fires, so a burst of messages
    becomes one read.
-3. The read opens the clipboard, retrying a few times because another app may
-   be holding it, and takes the text if there is any. Non-text content is
-   ignored.
+3. Before reading, the privacy gate (gate.py) is asked. If capture is paused
+   the clipboard is not opened at all. Otherwise the read opens the
+   clipboard, retrying a few times because another app may be holding it,
+   and while it is open: reads the sequence number, guesses the source app
+   (sourceapp.py), and lets the gate check for our own writes, the Windows
+   opt-out formats, and the exclusion list. Only if the gate allows it is
+   the text taken. Non-text content is ignored.
 4. The result is put on a queue. The listener never touches the UI or the
    database; whoever owns the queue does that on their own thread.
 
 SECURITY REVIEW (owner):
 
 - The captured text travels only inside ClipboardEvent objects on the queue.
-  This module logs lengths and sequence numbers, never the text.
+  This module logs lengths, sequence numbers, and skip reasons, never the
+  text or the source app name.
+- A change the gate refuses is never read: get_text() is not called, so the
+  text does not even pass through memory.
 - pywin32 prints a full traceback, message included, if a window-message
   handler raises. Every handler here therefore catches all exceptions and
   logs the exception class name only.
-- At this stage the listener captures every text copy. Pause mode, the app
-  exclusion list, and the Windows opt-out formats that password managers set
-  are NOT implemented yet, so this must not be used for daily capture until
-  the gate exists.
+- Pause is checked when the debounce timer fires, not at the moment of the
+  copy. A copy made just before pausing can therefore be skipped; one made
+  while paused is never captured.
 - There is no size limit on captured text yet.
 
 Not yet verified: the logic is tested with a fake clipboard and with real
@@ -53,6 +59,15 @@ import win32con
 import win32gui
 
 from smartclip import logsafe
+from smartclip.gate import FormatReader, Gate, OptOutFormats, SkipReason
+from smartclip.sourceapp import (
+    UNKNOWN_SOURCE,
+    SourceApp,
+    SourceMethod,
+    Win32WindowApi,
+    WindowApi,
+    find_source_app,
+)
 
 WM_CLIPBOARDUPDATE = 0x031D
 
@@ -97,13 +112,22 @@ class ClipboardEvent:
     text: str
     sequence_number: int
     captured_at: datetime
+    # Lower-case executable name, a best guess (see sourceapp.py).
+    source_app: str | None = None
+    source_method: SourceMethod = SourceMethod.UNKNOWN
 
 
-class ClipboardApi(Protocol):
-    """The clipboard operations the reader needs. Tests supply a fake."""
+class ClipboardApi(FormatReader, Protocol):
+    """The clipboard operations the reader needs. Tests supply a fake.
 
-    def open(self) -> None:
-        """Open the clipboard. Raises ClipboardBusyError if another app holds it."""
+    Includes the format checks the gate needs (FormatReader).
+    """
+
+    def open(self, window: int | None) -> None:
+        """Open the clipboard for a window (or None for no window).
+
+        Raises ClipboardBusyError if another app holds it.
+        """
 
     def close(self) -> None:
         """Close the clipboard."""
@@ -118,9 +142,9 @@ class ClipboardApi(Protocol):
 class Win32Clipboard:
     """The real Windows clipboard."""
 
-    def open(self) -> None:
+    def open(self, window: int | None) -> None:
         try:
-            win32clipboard.OpenClipboard(None)
+            win32clipboard.OpenClipboard(window)
         except pywintypes.error:
             raise ClipboardBusyError from None
 
@@ -141,6 +165,19 @@ class Win32Clipboard:
     def sequence_number(self) -> int:
         return win32clipboard.GetClipboardSequenceNumber()
 
+    def register_format(self, name: str) -> int:
+        return win32clipboard.RegisterClipboardFormat(name)
+
+    def has_format(self, format_id: int) -> bool:
+        return bool(win32clipboard.IsClipboardFormatAvailable(format_id))
+
+    def get_format_bytes(self, format_id: int) -> bytes | None:
+        try:
+            data = win32clipboard.GetClipboardData(format_id)
+        except (pywintypes.error, TypeError):
+            return None
+        return data if isinstance(data, bytes) else None
+
 
 class ClipboardReader:
     """Reads the clipboard once per change, with retry when it is busy."""
@@ -148,18 +185,35 @@ class ClipboardReader:
     def __init__(
         self,
         api: ClipboardApi,
+        gate: Gate | None = None,
+        windows: WindowApi | None = None,
         attempts: int = OPEN_ATTEMPTS,
         delay_seconds: float = RETRY_DELAY_SECONDS,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._api = api
+        self._gate = gate or Gate()
+        self._windows = windows or Win32WindowApi()
+        self._formats = OptOutFormats(api)
         self._attempts = attempts
         self._delay_seconds = delay_seconds
         self._sleep = sleep
         self._last_sequence: int | None = None
+        # The window the clipboard is opened for. The listener sets this to
+        # its hidden window. Seen on Windows 11 (owner's machine, 2026-11-18):
+        # with no window (None), OpenClipboard reported success on the
+        # listener thread after the first reads, yet the thread did not hold
+        # the clipboard, so reads failed and CloseClipboard raised error 1418.
+        # Opening for the listener's own window fixed it. The exact Windows
+        # reason was not confirmed.
+        self.window: int | None = None
 
     def read_new(self) -> ClipboardEvent | None:
         """Return an event if the clipboard holds text not yet seen, else None."""
+        skip = self._gate.skip_before_open()
+        if skip is not None:
+            _log_skip(skip, sequence=None)
+            return None
         if not self._open_with_retry():
             logsafe.log_event(
                 _log, "clipboard_busy", level=logging.WARNING, attempts=self._attempts
@@ -172,29 +226,59 @@ class ClipboardReader:
             sequence = self._api.sequence_number()
             if sequence == self._last_sequence:
                 return None
-            text = self._api.get_text()
+            source = self._find_source()
+            skip = self._gate.skip_while_open(self._api, self._formats, source)
+            # A refused change is never read.
+            text = self._api.get_text() if skip is None else None
             self._last_sequence = sequence
         finally:
             self._api.close()
 
+        if skip is not None:
+            _log_skip(skip, sequence=sequence)
+            return None
         if not text:
             logsafe.log_event(_log, "clipboard_skipped_no_text", sequence=sequence)
             return None
-        logsafe.log_event(_log, "clipboard_captured", length=len(text), sequence=sequence)
-        return ClipboardEvent(
-            text=text, sequence_number=sequence, captured_at=datetime.now(timezone.utc)
+        logsafe.log_event(
+            _log,
+            "clipboard_captured",
+            length=len(text),
+            sequence=sequence,
+            source_known=source.name is not None,
+            source_from_owner=source.method is SourceMethod.CLIPBOARD_OWNER,
         )
+        return ClipboardEvent(
+            text=text,
+            sequence_number=sequence,
+            captured_at=datetime.now(timezone.utc),
+            source_app=source.name,
+            source_method=source.method,
+        )
+
+    def _find_source(self) -> SourceApp:
+        """Guess the source app; a failed lookup must not stop the gate."""
+        try:
+            return find_source_app(self._windows)
+        except Exception as error:  # noqa: BLE001 - a hint is not worth a lost copy
+            logsafe.log_error(_log, "source_app_lookup_failed", error)
+            return UNKNOWN_SOURCE
 
     def _open_with_retry(self) -> bool:
         """Try to open the clipboard, waiting a little longer after each failure."""
         for attempt in range(1, self._attempts + 1):
             try:
-                self._api.open()
+                self._api.open(self.window)
                 return True
             except ClipboardBusyError:
                 if attempt < self._attempts:
                     self._sleep(self._delay_seconds * attempt)
         return False
+
+
+def _log_skip(reason: SkipReason, sequence: int | None) -> None:
+    """Log why a change was refused. The event name comes from the enum."""
+    logsafe.log_event(_log, f"clipboard_skipped_{reason.value}", sequence=sequence)
 
 
 class ClipboardListener:
@@ -204,10 +288,13 @@ class ClipboardListener:
         self,
         events: "queue.Queue[ClipboardEvent]",
         api: ClipboardApi | None = None,
+        gate: Gate | None = None,
+        windows: WindowApi | None = None,
         debounce_ms: int = DEBOUNCE_MS,
     ) -> None:
         self._events = events
-        self._reader = ClipboardReader(api or Win32Clipboard())
+        self.gate = gate or Gate()
+        self._reader = ClipboardReader(api or Win32Clipboard(), self.gate, windows)
         self._debounce_ms = debounce_ms
         self._thread: threading.Thread | None = None
         self._hwnd: int | None = None
@@ -263,6 +350,7 @@ class ClipboardListener:
         instance = win32api.GetModuleHandle(None)
         try:
             self._hwnd = self._create_window(class_name, instance)
+            self._reader.window = self._hwnd
         except (pywintypes.error, OSError) as error:
             self._start_failed = True
             logsafe.log_error(_log, "listener_start_failed", error)
@@ -277,6 +365,7 @@ class ClipboardListener:
             win32gui.PumpMessages()
         finally:
             self._hwnd = None
+            self._reader.window = None
             try:
                 win32gui.UnregisterClass(class_name, instance)
             except pywintypes.error:

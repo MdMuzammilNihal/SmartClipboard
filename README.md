@@ -14,10 +14,11 @@ A local, privacy-focused smart clipboard for Windows. It watches what you copy, 
 | Test that fails if app code imports a networking module | Done |
 | Encrypted storage (DPAPI + SQLite), with tests | Written and tested; not yet connected to a listener |
 | Logging that refuses clipboard content, with tests | Written and tested |
-| Clipboard listener (own thread, busy-retry, merging of repeated events) | Written; tested with a fake clipboard and real window messages. Not yet connected to storage, and not yet confirmed against real copies from other apps |
+| Clipboard listener (own thread, busy-retry, merging of repeated events) | Written; tested with a fake clipboard, real window messages, and opt-in tests that write fake text to the real clipboard (passing on the owner's Windows 11 machine). Passes every change through the privacy gate. Not yet connected to storage, and not yet confirmed against real copies from other apps |
 | Content labeling by rules | Written and tested on made-up examples only; accuracy on real copies is not measured. Known mislabels are listed in `tests/test_classify.py` |
 | Secret flagging by rules | Written and tested on made-up values only; thresholds are starting values, not measured. Known misses and false alarms are listed in `tests/test_secret_rules.py`. Not yet connected to capture |
-| Privacy controls (pause, exclusions, opt-out formats) | Not started |
+| Privacy gate (pause, app exclusion list, Windows opt-out formats, ignoring the app's own writes) | Written and tested with a fake clipboard; opt-out formats and own-write skipping also pass opt-in real-clipboard tests with fake text. Pause has no hotkey or tray toggle yet (comes with the UI). Not yet checked against a real password manager |
+| Source-app detection (clipboard owner, foreground window as fallback) | Written and tested with fake window lookups; how often it names the right app is not measured yet |
 | Retention and duplicate merging | Not started |
 | Hotkey search window | Not started |
 | Safe copy-back for secrets | Not started |
@@ -109,6 +110,7 @@ Other limits you should know:
 - **The Windows opt-out formats are cooperative.** Windows documents three clipboard formats for keeping data out of history and cloud sync: `ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory`, and `CanUploadToCloudClipboard`. This app honors them when watching and sets them when copying a secret back. Another clipboard manager is free to ignore them, so they are a courtesy, not a guarantee.
 - **Password managers are skipped only if they cooperate, or if you exclude them.** A password manager that does not set the opt-out formats will be captured unless you add it to the exclusion list. The default exclusion list is empty.
 - **Source-app detection is a best guess.** The app asks Windows which program owns the clipboard and falls back to the foreground window. Either can be wrong.
+- **The app's own clipboard writes are recognised by the clipboard owner.** If the clipboard is owned by one of this app's windows, the change is not captured. This includes copying text inside the app's own window.
 
 ## Privacy rules the code follows
 

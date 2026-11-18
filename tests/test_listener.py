@@ -15,6 +15,7 @@ import os
 import queue
 import time
 from collections.abc import Callable, Iterator
+from typing import Any
 
 import pytest
 import win32clipboard
@@ -54,7 +55,7 @@ class FakeClipboard:
         self.opens = 0
         self.closes = 0
 
-    def open(self) -> None:
+    def open(self, window: int | None = None) -> None:
         self.open_attempts += 1
         if self.busy_times > 0:
             self.busy_times -= 1
@@ -73,6 +74,37 @@ class FakeClipboard:
 
     def sequence_number(self) -> int:
         return self.sequence
+
+    # The listener's gate checks these; this fake never carries opt-out formats.
+    def register_format(self, name: str) -> int:
+        return 0xC000 + len(name)
+
+    def has_format(self, _format_id: int) -> bool:
+        return False
+
+    def get_format_bytes(self, _format_id: int) -> bytes | None:
+        return None
+
+
+class NoWindows:
+    """Window lookups that find nothing, so tests never read real windows."""
+
+    def clipboard_owner(self) -> int | None:
+        return None
+
+    def foreground_window(self) -> int | None:
+        return None
+
+    def process_id(self, _window: int) -> int | None:
+        return None
+
+    def executable_name(self, _process_id: int) -> str | None:
+        return None
+
+
+def make_reader(api: FakeClipboard, **options: Any) -> ClipboardReader:
+    """A reader with no gate settings and no real window lookups."""
+    return ClipboardReader(api, windows=NoWindows(), **options)
 
 
 def no_sleep(_seconds: float) -> None:
@@ -101,7 +133,7 @@ def log_output() -> Iterator[io.StringIO]:
 
 
 def test_text_is_captured_with_its_sequence_number() -> None:
-    reader = ClipboardReader(FakeClipboard(sequence=41))
+    reader = make_reader(FakeClipboard(sequence=41))
     event = reader.read_new()
     assert event is not None
     assert event.text == FAKE_TEXT
@@ -110,14 +142,14 @@ def test_text_is_captured_with_its_sequence_number() -> None:
 
 
 def test_same_change_is_not_captured_twice() -> None:
-    reader = ClipboardReader(FakeClipboard())
+    reader = make_reader(FakeClipboard())
     assert reader.read_new() is not None
     assert reader.read_new() is None
 
 
 def test_a_new_change_is_captured() -> None:
     api = FakeClipboard(sequence=1)
-    reader = ClipboardReader(api)
+    reader = make_reader(api)
     reader.read_new()
     api.sequence = 2
     api.text = "FAKE second copy"
@@ -128,7 +160,7 @@ def test_a_new_change_is_captured() -> None:
 def test_copying_the_same_text_again_is_a_new_event() -> None:
     # Merging duplicates is the storage layer's job, not the listener's.
     api = FakeClipboard(sequence=1)
-    reader = ClipboardReader(api)
+    reader = make_reader(api)
     reader.read_new()
     api.sequence = 2
     assert reader.read_new() is not None
@@ -137,7 +169,7 @@ def test_copying_the_same_text_again_is_a_new_event() -> None:
 @pytest.mark.parametrize("non_text", [None, ""])
 def test_non_text_content_is_ignored(non_text: str | None) -> None:
     api = FakeClipboard(text=non_text)
-    reader = ClipboardReader(api)
+    reader = make_reader(api)
     assert reader.read_new() is None
     # The change is remembered, so it is not read again.
     api.text = FAKE_TEXT
@@ -150,7 +182,7 @@ def test_non_text_content_is_ignored(non_text: str | None) -> None:
 def test_busy_clipboard_is_retried_until_it_opens() -> None:
     waits: list[float] = []
     api = FakeClipboard(busy_times=2)
-    reader = ClipboardReader(api, delay_seconds=0.02, sleep=waits.append)
+    reader = make_reader(api, delay_seconds=0.02, sleep=waits.append)
     assert reader.read_new() is not None
     assert api.open_attempts == 3
     assert waits == [0.02, 0.04]
@@ -158,7 +190,7 @@ def test_busy_clipboard_is_retried_until_it_opens() -> None:
 
 def test_gives_up_quietly_when_clipboard_stays_busy() -> None:
     api = FakeClipboard(busy_times=100)
-    reader = ClipboardReader(api, sleep=no_sleep)
+    reader = make_reader(api, sleep=no_sleep)
     assert reader.read_new() is None
     assert api.open_attempts == OPEN_ATTEMPTS
     assert api.closes == 0
@@ -166,14 +198,14 @@ def test_gives_up_quietly_when_clipboard_stays_busy() -> None:
 
 def test_item_is_still_captured_after_a_failed_read() -> None:
     api = FakeClipboard(busy_times=OPEN_ATTEMPTS)
-    reader = ClipboardReader(api, sleep=no_sleep)
+    reader = make_reader(api, sleep=no_sleep)
     assert reader.read_new() is None
     assert reader.read_new() is not None
 
 
 def test_clipboard_is_always_closed_after_opening() -> None:
     api = FakeClipboard()
-    reader = ClipboardReader(api)
+    reader = make_reader(api)
     reader.read_new()
     reader.read_new()
     assert api.opens == api.closes == 2
@@ -182,7 +214,7 @@ def test_clipboard_is_always_closed_after_opening() -> None:
 def test_clipboard_is_closed_even_if_reading_fails() -> None:
     api = FakeClipboard(fail_get_text=True)
     with pytest.raises(RuntimeError):
-        ClipboardReader(api).read_new()
+        make_reader(api).read_new()
     assert api.opens == api.closes == 1
 
 
@@ -191,7 +223,7 @@ def test_clipboard_is_closed_even_if_reading_fails() -> None:
 
 def test_reader_never_logs_the_text(log_output: io.StringIO) -> None:
     api = FakeClipboard(sequence=5)
-    reader = ClipboardReader(api, sleep=no_sleep)
+    reader = make_reader(api, sleep=no_sleep)
     reader.read_new()
     api.sequence, api.text = 6, None
     reader.read_new()
@@ -222,7 +254,7 @@ def send_update(listener: ClipboardListener) -> None:
 
 
 def test_listener_starts_and_stops_cleanly(events: "queue.Queue[ClipboardEvent]") -> None:
-    listener = ClipboardListener(events, api=FakeClipboard())
+    listener = ClipboardListener(events, windows=NoWindows(), api=FakeClipboard())
     listener.start()
     assert listener.is_running
     assert listener.window_handle is not None
@@ -232,11 +264,11 @@ def test_listener_starts_and_stops_cleanly(events: "queue.Queue[ClipboardEvent]"
 
 
 def test_stop_without_start_is_harmless(events: "queue.Queue[ClipboardEvent]") -> None:
-    ClipboardListener(events, api=FakeClipboard()).stop()
+    ClipboardListener(events, windows=NoWindows(), api=FakeClipboard()).stop()
 
 
 def test_starting_twice_is_an_error(events: "queue.Queue[ClipboardEvent]") -> None:
-    listener = ClipboardListener(events, api=FakeClipboard())
+    listener = ClipboardListener(events, windows=NoWindows(), api=FakeClipboard())
     listener.start()
     try:
         with pytest.raises(RuntimeError):
@@ -246,7 +278,7 @@ def test_starting_twice_is_an_error(events: "queue.Queue[ClipboardEvent]") -> No
 
 
 def test_listener_can_be_restarted(events: "queue.Queue[ClipboardEvent]") -> None:
-    listener = ClipboardListener(events, api=FakeClipboard())
+    listener = ClipboardListener(events, windows=NoWindows(), api=FakeClipboard())
     listener.start()
     listener.stop()
     listener.start()
@@ -257,7 +289,9 @@ def test_listener_can_be_restarted(events: "queue.Queue[ClipboardEvent]") -> Non
 def test_update_message_puts_an_event_on_the_queue(
     events: "queue.Queue[ClipboardEvent]",
 ) -> None:
-    listener = ClipboardListener(events, api=FakeClipboard(), debounce_ms=20)
+    listener = ClipboardListener(
+        events, windows=NoWindows(), api=FakeClipboard(), debounce_ms=20
+    )
     listener.start()
     try:
         send_update(listener)
@@ -273,7 +307,7 @@ def test_burst_of_updates_is_merged_into_one_read(
     # Every open reports a new sequence number, so without merging each of the
     # five messages would produce its own read and its own event.
     api = FakeClipboard(new_sequence_on_open=True)
-    listener = ClipboardListener(events, api=api, debounce_ms=100)
+    listener = ClipboardListener(events, windows=NoWindows(), api=api, debounce_ms=100)
     listener.start()
     try:
         for _ in range(5):
@@ -296,7 +330,7 @@ def test_failed_read_does_not_kill_the_listener_or_leak_text(
     capfd: pytest.CaptureFixture[str],
 ) -> None:
     api = FakeClipboard(new_sequence_on_open=True, fail_get_text=True)
-    listener = ClipboardListener(events, api=api, debounce_ms=20)
+    listener = ClipboardListener(events, windows=NoWindows(), api=api, debounce_ms=20)
     listener.start()
     try:
         send_update(listener)
@@ -316,9 +350,37 @@ def test_failed_read_does_not_kill_the_listener_or_leak_text(
     assert "capture_failed error_type=RuntimeError" in log_output.getvalue()
 
 
+class WindowRecordingClipboard(FakeClipboard):
+    def __init__(self) -> None:
+        super().__init__(new_sequence_on_open=True)
+        self.windows: list[int | None] = []
+
+    def open(self, window: int | None = None) -> None:
+        self.windows.append(window)
+        super().open(window)
+
+
+def test_listener_opens_the_clipboard_for_its_own_window(
+    events: "queue.Queue[ClipboardEvent]",
+) -> None:
+    # Opening with no window failed on a real machine after the first reads
+    # (see ClipboardReader.window), so the listener must pass its window.
+    api = WindowRecordingClipboard()
+    listener = ClipboardListener(events, windows=NoWindows(), api=api, debounce_ms=20)
+    listener.start()
+    try:
+        handle = listener.window_handle
+        send_update(listener)
+        events.get(timeout=3)
+    finally:
+        listener.stop()
+    assert api.windows == [handle]
+    assert handle is not None
+
+
 def test_two_listeners_can_run_at_once(events: "queue.Queue[ClipboardEvent]") -> None:
-    first = ClipboardListener(events, api=FakeClipboard())
-    second = ClipboardListener(events, api=FakeClipboard())
+    first = ClipboardListener(events, windows=NoWindows(), api=FakeClipboard())
+    second = ClipboardListener(events, windows=NoWindows(), api=FakeClipboard())
     first.start()
     second.start()
     try:
@@ -354,3 +416,32 @@ def test_real_copy_is_captured(events: "queue.Queue[ClipboardEvent]") -> None:
         finally:
             win32clipboard.CloseClipboard()
     assert event.text == FAKE_TEXT
+
+
+@pytest.mark.skipif(
+    os.environ.get("SMARTCLIP_REAL_CLIPBOARD_TESTS") != "1",
+    reason="replaces the real clipboard; set SMARTCLIP_REAL_CLIPBOARD_TESTS=1 to run",
+)
+def test_real_copies_in_a_row_are_all_captured(
+    events: "queue.Queue[ClipboardEvent]",
+) -> None:
+    # Regression: with OpenClipboard(None) only the first reads worked.
+    listener = ClipboardListener(events)
+    listener.start()
+    try:
+        for number in range(6):
+            text = f"{FAKE_TEXT}-{number}"
+            win32clipboard.OpenClipboard(None)
+            try:
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardText(text, win32con.CF_UNICODETEXT)
+            finally:
+                win32clipboard.CloseClipboard()
+            assert events.get(timeout=3).text == text
+    finally:
+        listener.stop()
+        win32clipboard.OpenClipboard(None)
+        try:
+            win32clipboard.EmptyClipboard()
+        finally:
+            win32clipboard.CloseClipboard()
