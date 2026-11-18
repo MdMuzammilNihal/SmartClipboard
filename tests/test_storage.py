@@ -139,6 +139,18 @@ def test_garbage_blob_is_skipped_and_reported(store: Store, db_path: Path) -> No
     assert [item.id for item in result.items] == [good_id]
 
 
+def test_unreadable_rows_report_their_creation_time(store: Store, db_path: Path) -> None:
+    bad_id = store.add(FAKE_SECRET, created_at=FAKE_CREATED)
+    no_time_id = store.add(FAKE_SECRET, created_at=FAKE_CREATED)
+    overwrite_payload(db_path, bad_id, b"garbage")
+    overwrite_payload(db_path, no_time_id, b"garbage")
+    with closing(sqlite3.connect(db_path)) as conn, conn:
+        conn.execute("UPDATE items SET created_at = 'not a time' WHERE id = ?", (no_time_id,))
+    result = store.load_all()
+    assert result.failed_ids == [bad_id, no_time_id]
+    assert result.failed_created == {bad_id: FAKE_CREATED}
+
+
 def test_tampered_blob_is_skipped_and_reported(store: Store, db_path: Path) -> None:
     item_id = store.add(FAKE_SECRET)
     blob = bytearray(read_blob(db_path, item_id))
@@ -175,6 +187,53 @@ def test_payload_error_does_not_carry_the_payload() -> None:
     # The JSON error, which keeps the text it failed on, must not be attached.
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+def test_version_2_fields_round_trip(store: Store) -> None:
+    payload = ItemPayload(
+        content="FAKE v2 note",
+        label=Label.NOTE,
+        dedupe_key="ab" * 32,
+        last_copied_at=FAKE_CREATED + timedelta(days=1),
+    )
+    store.add(payload, created_at=FAKE_CREATED)
+    assert store.load_all().items[0].payload == payload
+
+
+def test_version_1_payload_still_loads(store: Store, db_path: Path) -> None:
+    item_id = store.add(FAKE_NOTE)
+    version_1 = (
+        FAKE_NOTE.to_bytes()
+        .replace(b'"v":2', b'"v":1')
+        .replace(b',"dedupe_key":null,"last_copied_at":null', b"")
+    )
+    assert b"dedupe_key" not in version_1
+    overwrite_payload(db_path, item_id, dpapi.protect(version_1))
+    result = store.load_all()
+    assert result.failed_ids == []
+    assert result.items[0].payload == FAKE_NOTE
+
+
+@pytest.mark.parametrize("version", [b"0", b"3", b"true", b'"2"'])
+def test_unknown_payload_version_is_skipped(store: Store, db_path: Path, version: bytes) -> None:
+    item_id = store.add(FAKE_NOTE)
+    changed = FAKE_NOTE.to_bytes().replace(b'"v":2', b'"v":' + version)
+    overwrite_payload(db_path, item_id, dpapi.protect(changed))
+    assert store.load_all().failed_ids == [item_id]
+
+
+def test_stored_pinned_secret_is_refused(store: Store, db_path: Path) -> None:
+    item_id = store.add(FAKE_SECRET)
+    pinned = FAKE_SECRET.to_bytes().replace(b'"pinned":false', b'"pinned":true')
+    overwrite_payload(db_path, item_id, dpapi.protect(pinned))
+    assert store.load_all().failed_ids == [item_id]
+
+
+def test_wrong_type_in_new_field_is_skipped(store: Store, db_path: Path) -> None:
+    item_id = store.add(FAKE_NOTE)
+    changed = FAKE_NOTE.to_bytes().replace(b'"dedupe_key":null', b'"dedupe_key":5')
+    overwrite_payload(db_path, item_id, dpapi.protect(changed))
+    assert store.load_all().failed_ids == [item_id]
 
 
 # --- Update and delete ---

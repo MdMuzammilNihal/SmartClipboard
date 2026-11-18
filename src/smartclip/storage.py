@@ -21,13 +21,23 @@ Other choices:
 - `PRAGMA secure_delete` makes SQLite overwrite deleted rows with zeros
   instead of leaving them in free pages. It does not control copies the disk
   or file system may keep (SSD wear levelling, backups, shadow copies).
-- A row that cannot be decrypted or parsed is skipped and reported by id. It
-  never raises out of load_all(), so one damaged row cannot stop the app.
+- A row that cannot be decrypted or parsed is skipped and reported by id,
+  with its plaintext creation time when that is valid. It never raises out
+  of load_all(), so one damaged row cannot stop the app. history.py decides
+  when such rows are deleted.
 - Decoding errors are turned into PayloadError outside the `except` block, so
   the original error (a JSON error keeps a copy of the text it failed on) is
   not attached to the one we raise.
 - Decrypted items stay in Python memory while the app runs. Python cannot
   reliably wipe them.
+- Version 2 payloads add `dedupe_key` (the keyed hash used to merge
+  duplicates, see dedupe.py) and `last_copied_at` (when the item was last
+  copied). Both live inside the encrypted payload, so the file shows no hash
+  of the content in any form, and re-copying an item rewrites only the
+  encrypted payload, never the plaintext `created_at`. Version 1 rows still
+  load, with both fields empty.
+- A payload that is pinned while secret or unsure is refused (ValueError when
+  built, unreadable when loaded), because secrets cannot be pinned.
 
 Threading: a Store must be used from the thread that created it.
 """
@@ -35,7 +45,7 @@ Threading: a Store must be used from the thread that created it.
 import json
 import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Self
@@ -43,7 +53,9 @@ from typing import Self
 from smartclip import dpapi, logsafe
 from smartclip.labels import Label, SecretState
 
-PAYLOAD_VERSION = 1
+PAYLOAD_VERSION = 2
+# Versions load_all() can read. Version 1 has no dedupe_key or last_copied_at.
+_READABLE_VERSIONS = frozenset({1, 2})
 # The only kind in this version. The field exists so that other kinds can be
 # added later without migrating existing rows.
 KIND_TEXT = "text"
@@ -78,9 +90,19 @@ def _from_utc_text(text: str) -> datetime:
     return moment
 
 
+def _optional_time_text(moment: datetime | None) -> str | None:
+    return None if moment is None else _to_utc_text(moment)
+
+
 @dataclass(frozen=True)
 class ItemPayload:
-    """Everything about an item that is stored encrypted."""
+    """Everything about an item that is stored encrypted.
+
+    `expires_at` is the fixed deadline of a secret or unsure item. Normal
+    items expire by the time since `last_copied_at` instead (retention.py).
+    `last_copied_at` is None for items saved before version 2; their
+    creation time stands in for it.
+    """
 
     content: str
     label: Label
@@ -89,6 +111,12 @@ class ItemPayload:
     pinned: bool = False
     expires_at: datetime | None = None
     kind: str = KIND_TEXT
+    dedupe_key: str | None = None
+    last_copied_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.pinned and self.secret_state is not SecretState.NORMAL:
+            raise ValueError("secret and unsure items cannot be pinned")
 
     def to_bytes(self) -> bytes:
         """Serialize to JSON bytes, ready to be encrypted."""
@@ -100,7 +128,9 @@ class ItemPayload:
             "source_app": self.source_app,
             "secret_state": self.secret_state.value,
             "pinned": self.pinned,
-            "expires_at": None if self.expires_at is None else _to_utc_text(self.expires_at),
+            "expires_at": _optional_time_text(self.expires_at),
+            "dedupe_key": self.dedupe_key,
+            "last_copied_at": _optional_time_text(self.last_copied_at),
         }
         return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
@@ -121,16 +151,22 @@ class ItemPayload:
         """Build a payload from parsed JSON, raising on anything unexpected."""
         if not isinstance(data, dict):
             raise TypeError
-        if data["v"] != PAYLOAD_VERSION or data["kind"] != KIND_TEXT:
+        version = data["v"]
+        if type(version) is not int or version not in _READABLE_VERSIONS:
+            raise ValueError
+        if data["kind"] != KIND_TEXT:
             raise ValueError
         content = data["content"]
         source_app = data["source_app"]
         pinned = data["pinned"]
         expires_text = data["expires_at"]
+        dedupe_key = data["dedupe_key"] if version >= 2 else None
+        last_copied_text = data["last_copied_at"] if version >= 2 else None
         if not isinstance(content, str) or not isinstance(pinned, bool):
             raise TypeError
-        if source_app is not None and not isinstance(source_app, str):
-            raise TypeError
+        for optional_text in (source_app, dedupe_key, expires_text, last_copied_text):
+            if optional_text is not None and not isinstance(optional_text, str):
+                raise TypeError
         return cls(
             content=content,
             label=Label(data["label"]),
@@ -139,6 +175,8 @@ class ItemPayload:
             pinned=pinned,
             expires_at=None if expires_text is None else _from_utc_text(expires_text),
             kind=KIND_TEXT,
+            dedupe_key=dedupe_key,
+            last_copied_at=None if last_copied_text is None else _from_utc_text(last_copied_text),
         )
 
 
@@ -153,10 +191,15 @@ class StoredItem:
 
 @dataclass(frozen=True)
 class LoadResult:
-    """The readable items, plus the ids of rows that could not be read."""
+    """The readable items, plus the ids of rows that could not be read.
+
+    `failed_created` gives the plaintext creation time of each unreadable row
+    whose `created_at` is itself still valid, so retention can age them out.
+    """
 
     items: list[StoredItem]
     failed_ids: list[int]
+    failed_created: dict[int, datetime] = field(default_factory=dict)
 
 
 class Store:
@@ -225,17 +268,21 @@ class Store:
         ).fetchall()
         items: list[StoredItem] = []
         failed_ids: list[int] = []
+        failed_created: dict[int, datetime] = {}
         for item_id, created_text, blob in rows:
             item = _decode_row(item_id, created_text, blob)
             if item is None:
                 failed_ids.append(item_id)
+                created_at = _created_or_none(created_text)
+                if created_at is not None:
+                    failed_created[item_id] = created_at
                 logsafe.log_event(
                     _log, "item_unreadable", level=logging.WARNING, item_id=item_id
                 )
             else:
                 items.append(item)
         logsafe.log_event(_log, "items_loaded", count=len(items), failed=len(failed_ids))
-        return LoadResult(items=items, failed_ids=failed_ids)
+        return LoadResult(items=items, failed_ids=failed_ids, failed_created=failed_created)
 
     def vacuum(self) -> None:
         """Rebuild the file so space freed by deletes is returned to the disk."""
@@ -253,3 +300,13 @@ def _decode_row(item_id: int, created_text: object, blob: object) -> StoredItem 
     except (dpapi.DpapiError, PayloadError, ValueError):
         return None
     return StoredItem(id=item_id, created_at=created_at, payload=payload)
+
+
+def _created_or_none(created_text: object) -> datetime | None:
+    """Parse a row's plaintext creation time, or return None if it is not valid."""
+    if not isinstance(created_text, str):
+        return None
+    try:
+        return _from_utc_text(created_text)
+    except ValueError:
+        return None

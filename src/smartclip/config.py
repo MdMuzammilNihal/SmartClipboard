@@ -13,6 +13,7 @@ from pathlib import Path
 APP_DIR_NAME = "SmartClipboard"
 DATABASE_FILE_NAME = "items.db"
 LOG_DIR_NAME = "logs"
+DEDUPE_KEY_FILE_NAME = "dedupe.key"
 
 
 @dataclass(frozen=True)
@@ -43,8 +44,19 @@ LOGIN_SOURCE_APPS: frozenset[str] = frozenset()
 # machine first. The settings screen will edit this later.
 EXCLUDED_APPS: frozenset[str] = frozenset()
 
-# How long secrets and unsure items are kept (owner's decision: 2 hours).
+# How long secrets and unsure items are kept (owner's decision: 2 hours),
+# counted from the first copy. Copying one again does not restart it
+# (owner's decision, 2026-11-18).
 SECRET_RETENTION = timedelta(hours=2)
+
+# How long normal items are kept after they were last copied (owner's
+# decision: 90 days, a starting value to adjust after daily use). Pinned
+# normal items are never deleted by retention.
+NORMAL_RETENTION = timedelta(days=90)
+
+# The shortest time between two VACUUM runs. A starting value, not measured:
+# VACUUM rewrites the whole file, so it should not run after every cleanup.
+VACUUM_INTERVAL = timedelta(days=1)
 
 # Global hotkeys (owner's decisions, 2026-11-12 and 2026-11-18). Not yet
 # tested for clashes with other apps. Opening the window (Ctrl+Alt+V) and the
@@ -64,6 +76,11 @@ def app_data_dir() -> Path:
 def database_path() -> Path:
     """Return the path of the encrypted item database."""
     return app_data_dir() / DATABASE_FILE_NAME
+
+
+def dedupe_key_path() -> Path:
+    """Return the path of the DPAPI-protected key used to detect duplicates."""
+    return app_data_dir() / DEDUPE_KEY_FILE_NAME
 
 
 def log_dir() -> Path:

@@ -20,7 +20,7 @@ A local, privacy-focused smart clipboard for Windows. It watches what you copy, 
 | Privacy gate (pause, app exclusion list, Windows opt-out formats, ignoring the app's own writes) | Written and tested with a fake clipboard; opt-out formats and own-write skipping also pass opt-in real-clipboard tests with fake text. Pause has no hotkey or tray toggle yet (comes with the UI). Not yet checked against a real password manager |
 | Manual overrides: force-save and mark-as-secret hotkeys | Hotkey registration, force-save, and the mark-as-secret rule are written and tested (force-save also on the real clipboard with fake text). Not usable yet: storage and the hotkeys are not connected to the app. Real key presses are untested |
 | Source-app detection (clipboard owner, foreground window as fallback) | Written and tested with fake window lookups; how often it names the right app is not measured yet |
-| Retention and duplicate merging | Not started |
+| Retention, duplicate merging, and pin rules | Written and tested with fake data on a temporary database: duplicates merge through a keyed hash and move to the top; normal items expire 90 days after the last copy; secrets and unsure items 2 hours after the first copy (copying again does not extend it); pinned normal items are kept; secrets and unsure items cannot be pinned. Not yet connected to the listener or run against real use |
 | Hotkey search window | Not started |
 | Safe copy-back for secrets | Not started |
 
@@ -126,13 +126,15 @@ Other limits you should know:
 - The database lives under `%LOCALAPPDATA%\SmartClipboard\`, never inside the repository.
 - Duplicates are detected with a keyed hash (HMAC-SHA256 with a random key that is itself DPAPI-protected). A plain hash of a short secret could be brute-forced by someone holding the file.
 - A corrupted or tampered row is skipped and reported by ID. It must not crash the app.
+- Copying the same text again merges it into the existing item and moves it to the top. The time of the latest copy is stored inside the encrypted payload; the readable creation time stays the time of the first copy.
+- A row that can no longer be decrypted is deleted once its readable creation time is more than 90 days old, but only when other rows still decrypt. If no row decrypts, the problem is more likely the Windows account than damage, so nothing is deleted.
 
 | Item | Default | Configurable |
 |---|---|---|
-| Normal items | Deleted after 90 days | Yes |
-| Secrets and unsure items | Deleted after 2 hours | Yes |
+| Normal items | Deleted 90 days after they were last copied | Yes |
+| Secrets and unsure items | Deleted 2 hours after the first copy; copying again does not extend this | Yes |
 | Pinned normal items | Kept until unpinned | |
-| Secrets | Cannot be pinned | |
+| Secrets and unsure items | Cannot be pinned | |
 
 ## Default hotkeys
 
