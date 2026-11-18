@@ -25,6 +25,10 @@ How it works:
 6. Copy-back (task 12): request_copy_back() asks the listener thread to
    write an item back to the clipboard for the listener's own window, and
    for a secret, to clear it again later (copyback.py).
+7. Captured secrets (owner's decision 2026-11-19, option B):
+   request_capture_clear() asks the listener thread to empty the
+   clipboard 30 seconds after a clearly secret item was captured, if
+   nothing was copied since (copyback.py).
 
 SECURITY REVIEW (owner):
 
@@ -82,6 +86,9 @@ WM_CLIPBOARDUPDATE = 0x031D
 WM_FORCE_SAVE = win32con.WM_APP + 1
 # Our own message asking the listener thread to run queued copy-backs.
 WM_COPY_BACK = win32con.WM_APP + 2
+# Our own message asking the listener thread to (re)schedule or cancel the
+# clear of a captured secret.
+WM_CAPTURE_CLEAR = win32con.WM_APP + 3
 
 # How long to wait after the last change message before reading. Long enough
 # to merge the messages from one copy, short enough to feel instant.
@@ -94,6 +101,8 @@ RETRY_DELAY_SECONDS = 0.02
 _TIMER_ID = 1
 # Timer for clearing a secret after copy-back.
 _CLEAR_TIMER_ID = 2
+# Timer for clearing a secret captured from another app.
+_CAPTURE_CLEAR_TIMER_ID = 3
 # If the clipboard is busy when the clear is due, try again this often, at
 # most this many times, before giving up.
 CLEAR_RETRY_MS = 1000
@@ -345,6 +354,10 @@ class ClipboardListener:
         self._copy_back = copy_back or CopyBack()
         self._copy_requests: "queue.Queue[tuple[str, bool, Future[bool]]]" = queue.Queue()
         self._clear_retries = 0
+        self._capture_clear_retries = 0
+        # The latest capture-clear request: a sequence number, or None to cancel.
+        self._capture_clear_lock = threading.Lock()
+        self._capture_clear_request: tuple[int | None] | None = None
         self._thread: threading.Thread | None = None
         self._hwnd: int | None = None
         self._ready = threading.Event()
@@ -415,6 +428,24 @@ class ClipboardListener:
             return None
         return future
 
+    def request_capture_clear(self, sequence: int | None) -> bool:
+        """Ask the listener thread to clear a captured secret later, or cancel that.
+
+        Safe to call from any thread. `sequence` is the clipboard sequence
+        number the secret was read at; None cancels a pending clear. Only the
+        latest request counts. Returns False if the listener is not running.
+        """
+        hwnd = self._hwnd
+        if hwnd is None:
+            return False
+        with self._capture_clear_lock:
+            self._capture_clear_request = (sequence,)
+        try:
+            win32gui.PostMessage(hwnd, WM_CAPTURE_CLEAR, 0, 0)
+        except pywintypes.error:
+            return False
+        return True
+
     def stop(self) -> None:
         """Ask the listener thread to finish and wait for it."""
         thread = self._thread
@@ -471,6 +502,7 @@ class ClipboardListener:
             win32con.WM_TIMER: self._on_timer,
             WM_FORCE_SAVE: self._on_force_save,
             WM_COPY_BACK: self._on_copy_back,
+            WM_CAPTURE_CLEAR: self._on_capture_clear,
             win32con.WM_DESTROY: self._on_destroy,
         }
         atom = win32gui.RegisterClass(window_class)
@@ -495,6 +527,8 @@ class ClipboardListener:
         """A timer fired: the copy-back clear, or the end of a burst of changes."""
         if wparam == _CLEAR_TIMER_ID:
             return self._on_clear_timer(hwnd)
+        if wparam == _CAPTURE_CLEAR_TIMER_ID:
+            return self._on_capture_clear_timer(hwnd)
         # The burst is over: read the clipboard once and queue the result.
         _user32.KillTimer(hwnd, _TIMER_ID)
         try:
@@ -553,13 +587,50 @@ class ClipboardListener:
             logsafe.log_error(_log, "copy_back_clear_failed", error)
         return 0
 
+    def _on_capture_clear(self, hwnd: int, _message: int, _wparam: int, _lparam: int) -> int:
+        """Schedule (or cancel) the clear of a captured secret."""
+        with self._capture_clear_lock:
+            request, self._capture_clear_request = self._capture_clear_request, None
+        if request is None:
+            return 0
+        (sequence,) = request
+        try:
+            if sequence is None:
+                _user32.KillTimer(hwnd, _CAPTURE_CLEAR_TIMER_ID)
+                self._copy_back.cancel_capture_clear()
+            else:
+                self._capture_clear_retries = 0
+                self._copy_back.schedule_capture_clear(sequence)
+                clear_ms = int(self._copy_back.capture_clear_after.total_seconds() * 1000)
+                _user32.SetTimer(hwnd, _CAPTURE_CLEAR_TIMER_ID, clear_ms, None)
+        except Exception as error:  # noqa: BLE001 - see SECURITY REVIEW above
+            logsafe.log_error(_log, "capture_clear_schedule_failed", error)
+        return 0
+
+    def _on_capture_clear_timer(self, hwnd: int) -> int:
+        """The time is up: clear the captured secret if nothing was copied since."""
+        _user32.KillTimer(hwnd, _CAPTURE_CLEAR_TIMER_ID)
+        try:
+            outcome = self._copy_back.clear_capture_if_unchanged(hwnd)
+            if outcome is ClearOutcome.BUSY:
+                self._capture_clear_retries += 1
+                if self._capture_clear_retries < CLEAR_RETRY_LIMIT:
+                    _user32.SetTimer(hwnd, _CAPTURE_CLEAR_TIMER_ID, CLEAR_RETRY_MS, None)
+                else:
+                    self._copy_back.give_up_capture_clear()
+        except Exception as error:  # noqa: BLE001 - see SECURITY REVIEW above
+            logsafe.log_error(_log, "capture_clear_failed", error)
+        return 0
+
     def _on_destroy(self, hwnd: int, _message: int, _wparam: int, _lparam: int) -> int:
         """The window is closing: clear a pending secret, unregister, end the loop."""
         _user32.KillTimer(hwnd, _TIMER_ID)
         _user32.KillTimer(hwnd, _CLEAR_TIMER_ID)
+        _user32.KillTimer(hwnd, _CAPTURE_CLEAR_TIMER_ID)
         try:
             # Do not leave a secret on the clipboard after the app is gone.
             self._copy_back.clear_if_ours(hwnd)
+            self._copy_back.clear_capture_if_unchanged(hwnd)
         except Exception as error:  # noqa: BLE001 - see SECURITY REVIEW above
             logsafe.log_error(_log, "copy_back_clear_failed", error)
         _user32.RemoveClipboardFormatListener(hwnd)

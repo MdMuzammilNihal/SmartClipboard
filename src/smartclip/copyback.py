@@ -50,6 +50,32 @@ SECURITY REVIEW (owner):
 - The text is held in memory only while it is being written and while it
   waits in the request queue. Logs record lengths and outcomes only.
 
+Clearing a captured secret (owner's decision 2026-11-19, option B):
+
+When the app captures a clearly secret item that another app copied, the
+secret would otherwise stay on the clipboard until something else is
+copied. schedule_capture_clear() and clear_capture_if_unchanged() empty
+the clipboard `CAPTURED_SECRET_CLEAR_AFTER` (default 30 seconds) later,
+so it can still be pasted once.
+
+SECURITY REVIEW (owner), captured secrets:
+
+- "Unchanged" is checked by the clipboard sequence number recorded when
+  the item was read, not by the owner: the owner is the other app, and an
+  app may copy twice in a row. Reading the clipboard does not change the
+  number (checked on the owner's machine, 2026-11-18, see overrides.py),
+  so the number still matches if, and only if, nothing was copied since.
+  The check and the clear happen while we hold the clipboard open, so no
+  other app can change it in between.
+- Only the latest captured secret is pending; a newer one replaces it
+  (the older number could not match any more anyway). Cancelled when the
+  owner marks that item normal.
+- Unsure items are not cleared, so a false alarm never wipes normal text.
+- When the app quits, a pending clear runs at once if still unchanged,
+  the same as for copy-back.
+- Win+V history and cloud sync are not touched: an item Windows already
+  recorded stays there. Removing it would need a new dependency.
+
 Tested with a fake clipboard, and with opt-in tests that write fake text to
 the real clipboard (passing on the owner's Windows 11 machine, 2026-11-18).
 Not yet checked that Win+V history
@@ -90,6 +116,7 @@ class ClearOutcome(StrEnum):
 
     CLEARED = "cleared"
     REPLACED = "replaced"  # the clipboard holds something newer; left alone
+    CANCELLED = "cancelled"  # the owner marked the item normal first
     NOTHING_PENDING = "nothing_pending"
     BUSY = "busy"
 
@@ -117,6 +144,9 @@ class ClipboardWriter(Protocol):
 
     def owner(self) -> int | None:
         """Return the window that owns the clipboard, or None."""
+
+    def sequence_number(self) -> int:
+        """Return Windows' counter that increases on every clipboard change."""
 
 
 class Win32ClipboardWriter:
@@ -150,6 +180,9 @@ class Win32ClipboardWriter:
         except pywintypes.error:
             return None
 
+    def sequence_number(self) -> int:
+        return win32clipboard.GetClipboardSequenceNumber()
+
 
 class CopyBack:
     """Writes items back and clears safe copies later. Use from one thread only."""
@@ -158,17 +191,21 @@ class CopyBack:
         self,
         api: ClipboardWriter | None = None,
         clear_after: timedelta = config.COPYBACK_CLEAR_AFTER,
+        capture_clear_after: timedelta = config.CAPTURED_SECRET_CLEAR_AFTER,
         attempts: int = OPEN_ATTEMPTS,
         delay_seconds: float = RETRY_DELAY_SECONDS,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._api = api or Win32ClipboardWriter()
         self.clear_after = clear_after
+        self.capture_clear_after = capture_clear_after
         self._attempts = attempts
         self._delay_seconds = delay_seconds
         self._sleep = sleep
         self._opt_out_ids = [self._api.register_format(name) for name in OPT_OUT_FORMAT_NAMES]
         self._clear_pending = False
+        # The sequence number of a captured secret waiting to be cleared.
+        self._capture_pending: int | None = None
 
     @property
     def clear_pending(self) -> bool:
@@ -221,6 +258,49 @@ class CopyBack:
         if self._clear_pending:
             self._clear_pending = False
             logsafe.log_event(_log, "copy_back_clear_gave_up")
+
+    @property
+    def capture_clear_pending(self) -> bool:
+        """True while a captured secret waits to be cleared."""
+        return self._capture_pending is not None
+
+    def schedule_capture_clear(self, sequence: int) -> None:
+        """Remember a captured secret; the caller runs clear_capture_if_unchanged() later."""
+        self._capture_pending = sequence
+        logsafe.log_event(_log, "capture_clear_scheduled", sequence=sequence)
+
+    def cancel_capture_clear(self) -> None:
+        """Forget the pending captured secret, for example after mark normal."""
+        if self._capture_pending is not None:
+            self._capture_pending = None
+            logsafe.log_event(_log, f"capture_clear_{ClearOutcome.CANCELLED.value}")
+
+    def clear_capture_if_unchanged(self, window: int) -> ClearOutcome:
+        """Empty the clipboard if it still holds the captured secret."""
+        pending = self._capture_pending
+        if pending is None:
+            return ClearOutcome.NOTHING_PENDING
+        if not self._open_with_retry(window):
+            outcome = ClearOutcome.BUSY
+        else:
+            try:
+                if self._api.sequence_number() == pending:
+                    self._api.empty()
+                    outcome = ClearOutcome.CLEARED
+                else:
+                    outcome = ClearOutcome.REPLACED
+            finally:
+                self._api.close()
+        if outcome is not ClearOutcome.BUSY:
+            self._capture_pending = None
+        logsafe.log_event(_log, f"capture_clear_{outcome.value}", sequence=pending)
+        return outcome
+
+    def give_up_capture_clear(self) -> None:
+        """Stop trying after repeated busy failures."""
+        if self._capture_pending is not None:
+            self._capture_pending = None
+            logsafe.log_event(_log, "capture_clear_gave_up")
 
     def _open_with_retry(self, window: int) -> bool:
         for attempt in range(1, self._attempts + 1):

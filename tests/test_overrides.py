@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from smartclip import config
 from smartclip.labels import Label, SecretState
-from smartclip.overrides import LastCapture, mark_secret
+from smartclip.overrides import LastCapture, mark_normal, mark_secret
 from smartclip.storage import ItemPayload
 
 NOW = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
@@ -97,3 +97,29 @@ def test_forgetting_a_deleted_item() -> None:
     assert last.item_for(40) == 7
     last.forget(7)
     assert last.item_for(40) is None
+
+
+# --- Marking normal (from the window) ---
+
+
+def test_mark_normal_clears_state_and_expiry() -> None:
+    secret = mark_secret(NORMAL, NOW)
+    marked = mark_normal(secret)
+    assert marked.secret_state is SecretState.NORMAL
+    assert marked.expires_at is None
+    assert marked.pinned is False
+    assert marked.label is Label.NOTE
+
+
+def test_mark_normal_relabels_possible_secret_by_content() -> None:
+    unsure = ItemPayload(
+        content="https://example.test/fake-override",
+        label=Label.POSSIBLE_SECRET,
+        secret_state=SecretState.UNSURE,
+        expires_at=NOW,
+    )
+    assert mark_normal(unsure).label is Label.LINK
+
+
+def test_mark_normal_of_normal_item_changes_nothing() -> None:
+    assert mark_normal(NORMAL) is NORMAL

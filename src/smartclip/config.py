@@ -58,13 +58,37 @@ NORMAL_RETENTION = timedelta(days=90)
 # before it is cleared (CLAUDE.md section 9: "about 30 seconds").
 COPYBACK_CLEAR_AFTER = timedelta(seconds=30)
 
+# How long a secret copied in another app stays on the clipboard after the
+# app captures it, before it is cleared (owner's decision 2026-11-19,
+# option B). Only clearly secret items, and only if nothing was copied since.
+CAPTURED_SECRET_CLEAR_AFTER = timedelta(seconds=30)
+
 # The shortest time between two VACUUM runs. A starting value, not measured:
 # VACUUM rewrites the whole file, so it should not run after every cleanup.
 VACUUM_INTERVAL = timedelta(days=1)
 
+# How long a secret or unsure item stays readable after the owner clicks to
+# reveal it in the window (owner's decision, 2026-11-18). It is masked again
+# sooner if the window hides.
+REVEAL_DURATION = timedelta(seconds=10)
+
+# Keep the search window out of screenshots, recordings, and screen sharing
+# (see ui/capture_guard.py). Set to False to take screenshots of it.
+EXCLUDE_FROM_SCREEN_CAPTURE = True
+
+# The name of the lock that stops a second copy of the app from running. It
+# lives in this Windows session only (the "Local" namespace), so other
+# accounts' copies are not affected.
+SINGLE_INSTANCE_NAME = "Local\\SmartClipboard-single-instance"
+
+# How often the app checks for expired items while it runs. A starting value:
+# a secret can outlive its 2-hour deadline by up to this long.
+CLEANUP_INTERVAL = timedelta(minutes=1)
+
 # Global hotkeys (owner's decisions, 2026-11-12 and 2026-11-18). Not yet
-# tested for clashes with other apps. Opening the window (Ctrl+Alt+V) and the
-# pause toggle (Ctrl+Alt+P) are registered when the UI exists.
+# tested for clashes with other apps.
+HOTKEY_OPEN_WINDOW = "Ctrl+Alt+V"
+HOTKEY_PAUSE = "Ctrl+Alt+P"
 HOTKEY_MARK_SECRET = "Ctrl+Alt+S"
 HOTKEY_FORCE_SAVE = "Ctrl+Alt+F"
 

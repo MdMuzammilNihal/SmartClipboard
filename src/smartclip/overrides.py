@@ -7,7 +7,7 @@ Owner's decisions (2026-11-18):
   item kept for 90 days, which is the worse mistake. Pressing it again does
   nothing more.
 - Marking an item normal is done in the window (the "Review?" badge), not by
-  hotkey. That comes with the UI.
+  hotkey. The window calls mark_normal() below.
 - Force-save (Ctrl+Alt+F) lives in the listener, because it must read the
   clipboard (see listener.ClipboardListener.request_force_save).
 
@@ -27,6 +27,11 @@ SECURITY REVIEW (owner):
   the short secret expiry, counted from the moment of marking.
 - An item that is already secret is returned unchanged, so pressing the
   hotkey again never extends how long a secret is kept.
+- mark_normal() (from the window) clears the secret state and the short
+  expiry. The item then follows normal retention, counted from its last
+  copy. An item labeled "possible secret" is labeled again by the content
+  rules, since that label only came from secret detection. It does not pin
+  the item; the owner pins it separately if wanted.
 - Not wired yet: storage is not connected to the listener, so nothing calls
   this outside tests. The app (app.py, not built) will run it on the thread
   that owns the Store, since a Store must stay on its own thread.
@@ -36,8 +41,8 @@ import threading
 from dataclasses import dataclass, replace
 from datetime import datetime
 
-from smartclip import config
-from smartclip.labels import SecretState
+from smartclip import classify, config
+from smartclip.labels import Label, SecretState
 from smartclip.storage import ItemPayload
 
 
@@ -51,6 +56,16 @@ def mark_secret(payload: ItemPayload, now: datetime) -> ItemPayload:
         pinned=False,
         expires_at=now + config.SECRET_RETENTION,
     )
+
+
+def mark_normal(payload: ItemPayload) -> ItemPayload:
+    """Return the payload marked normal, or unchanged if it already is."""
+    if payload.secret_state is SecretState.NORMAL:
+        return payload
+    label = payload.label
+    if label is Label.POSSIBLE_SECRET:
+        label = classify.classify(payload.content).label
+    return replace(payload, secret_state=SecretState.NORMAL, label=label, expires_at=None)
 
 
 @dataclass(frozen=True)

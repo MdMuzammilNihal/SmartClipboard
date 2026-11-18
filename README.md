@@ -6,7 +6,7 @@ A local, privacy-focused smart clipboard for Windows. It watches what you copy, 
 
 ## Status
 
-**Early development. The app does not work yet.** This README describes the design that is being built. Nothing below has been verified on a real machine unless the table says so.
+**Early development.** The pieces are now wired into a first runnable app (`python -m smartclip`), but it has not yet been used on real copies from other apps. This README describes the design that is being built. Nothing below has been verified on a real machine unless the table says so.
 
 | Part | State |
 |---|---|
@@ -17,11 +17,14 @@ A local, privacy-focused smart clipboard for Windows. It watches what you copy, 
 | Clipboard listener (own thread, busy-retry, merging of repeated events) | Written; tested with a fake clipboard, real window messages, and opt-in tests that write fake text to the real clipboard (passing on the owner's Windows 11 machine). Passes every change through the privacy gate. Not yet connected to storage, and not yet confirmed against real copies from other apps |
 | Content labeling by rules | Written and tested on made-up examples only; accuracy on real copies is not measured. Known mislabels are listed in `tests/test_classify.py` |
 | Secret flagging by rules | Written and tested on made-up values only; thresholds are starting values, not measured. Known misses and false alarms are listed in `tests/test_secret_rules.py`. Not yet connected to capture |
-| Privacy gate (pause, app exclusion list, Windows opt-out formats, ignoring the app's own writes) | Written and tested with a fake clipboard; opt-out formats and own-write skipping also pass opt-in real-clipboard tests with fake text. Pause has no hotkey or tray toggle yet (comes with the UI). Not yet checked against a real password manager |
-| Manual overrides: force-save and mark-as-secret hotkeys | Hotkey registration, force-save, and the mark-as-secret rule are written and tested (force-save also on the real clipboard with fake text). Not usable yet: storage and the hotkeys are not connected to the app. Real key presses are untested |
+| Privacy gate (pause, app exclusion list, Windows opt-out formats, ignoring the app's own writes) | Written and tested with a fake clipboard; opt-out formats and own-write skipping also pass opt-in real-clipboard tests with fake text. Pause is toggled by `Ctrl+Alt+P` or the window's Pause button and shown in the window; there is no tray toggle yet, and the hotkey has not been pressed for real. Not yet checked against a real password manager |
+| Manual overrides: force-save and mark-as-secret hotkeys | Hotkey registration, force-save, and the mark-as-secret rule are written and tested (force-save also on the real clipboard with fake text). Now connected to storage through `app.py`. Real key presses are untested |
 | Source-app detection (clipboard owner, foreground window as fallback) | Written and tested with fake window lookups; how often it names the right app is not measured yet |
 | Retention, duplicate merging, and pin rules | Written and tested with fake data on a temporary database: duplicates merge through a keyed hash and move to the top; normal items expire 90 days after the last copy; secrets and unsure items 2 hours after the first copy (copying again does not extend it); pinned normal items are kept; secrets and unsure items cannot be pinned. Not yet connected to the listener or run against real use |
-| Hotkey search window | Not started |
+| Hotkey search window (search, coloured type badges, click a badge to filter, pin, re-copy, delete, mark normal or secret, pause indicator) | Written; tested with a fake backend in an off-screen Qt window. Started on the owner's machine with capture paused and a throwaway data folder: it opened, registered its hotkeys, was marked as excluded from screen capture along with its tooltips and dialogs (read back from Windows; tooltips were added after the owner saw one in a screen recording), refused a second copy, and shut down cleanly. Hiding when another app takes the focus is tested with a fake focus check only. Not yet used by hand: real key presses, the window coming to the front over other apps, and how it looks have not been checked |
+| Masked secrets (bullets, left out of search, revealed for 10 seconds by a click) | Written and tested with fake data, including a check that a masked row never hands its text to the window in any form. Not yet looked at on screen |
+| Wiring (`app.py`: listener to labeling to storage, hotkeys, cleanup timer) | Written; the capture path is tested with fake events on a temporary database. Not yet run on real copies. Only one copy runs at a time. No tray icon or settings screen yet |
+| Clearing secrets copied in other apps (30 seconds after capture, only if nothing was copied since; not for "Review?" items) | Written; tested with a fake clipboard and real window messages. An opt-in test with fake text on the real clipboard exists; not yet run on the owner's machine. Win+V history is not touched |
 | Safe copy-back for secrets | Written; tested with a fake clipboard and real window messages. Opt-in tests that write fake text to the real clipboard pass on the owner's Windows 11 machine (opt-out formats set, own write not captured, cleared after the delay, a newer copy left alone). Not yet checked that Win+V history and cloud sync really leave the item out. Nothing calls it yet (the window is not built) |
 
 This table is updated as work lands.
@@ -111,7 +114,10 @@ Other limits you should know:
 - **The Windows opt-out formats are cooperative.** Windows documents three clipboard formats for keeping data out of history and cloud sync: `ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory`, and `CanUploadToCloudClipboard`. This app honors them when watching and sets them when copying a secret back. Another clipboard manager is free to ignore them, so they are a courtesy, not a guarantee.
 - **Password managers are skipped only if they cooperate, or if you exclude them.** A password manager that does not set the opt-out formats will be captured unless you add it to the exclusion list. The default exclusion list is empty.
 - **Source-app detection is a best guess.** The app asks Windows which program owns the clipboard and falls back to the foreground window. Either can be wrong.
+- **A secret you copy in another app is cleared from the clipboard after about 30 seconds, but stays in Win+V history.** When the app captures something it is sure is a secret, it empties the clipboard 30 seconds later, so you can still paste it once. It only does this if nothing was copied since (checked with Windows' clipboard change counter), so a newer copy is never wiped. Marking an item secret while it is still on the clipboard (the button or `Ctrl+Alt+S`) does the same; marking it normal cancels it. "Review?" items are not cleared, so a false alarm never wipes normal text. If Windows clipboard history (Win+V) or cloud sync is on, Windows has usually recorded the secret already; this app does not remove it from there. Turn clipboard history off, or delete the entry in Win+V, if that matters to you.
 - **Copy-back of a secret is cleared after about 30 seconds, only if it is still on the clipboard.** "Still there" means this app's window still owns the clipboard: any other app that copies takes ownership, so a newer copy is never wiped. An app that adds data without emptying the clipboard first (unusual) would be cleared along with the secret. If the clipboard is busy, the clear is retried for a few seconds and then given up. Quitting the app clears a pending secret at once. During those 30 seconds, a clipboard manager that ignores the opt-out formats can still record it. Unsure items are copied back the same way.
+- **A revealed item is ordinary window text while it is revealed.** Screen readers and other accessibility or automation tools running under your account can read it, like any other window's text. Masked items expose only the bullets. Programs under your account are already outside what this app can protect against.
+- **The app's windows are kept out of screen capture, cooperatively.** The app asks Windows to leave every window it opens (the search window and its tooltips, menus, and dialogs) out of screenshots, recordings, and screen sharing, so opening it during a call does not show your history. This works through Windows' own capture paths only: it does nothing against a phone camera, and a program under your account could undo it. It also hides the window from your own screenshots; set `EXCLUDE_FROM_SCREEN_CAPTURE = False` in `config.py` to take them.
 - **The app's own clipboard writes are recognised by the clipboard owner.** If the clipboard is owned by one of this app's windows, the change is not captured. This includes copying text inside the app's own window.
 
 ## Privacy rules the code follows
@@ -148,7 +154,7 @@ Other limits you should know:
 
 These are configurable. They have not yet been tested for clashes with other apps; if another app already holds a combination, it is reported instead of taken over.
 
-- **Mark as secret** always marks secret, never back to normal, so a second press cannot undo a detection. It applies only while the clipboard still holds that item. Marking an item normal will be done in the window.
+- **Mark as secret** always marks secret, never back to normal, so a second press cannot undo a detection. It applies only while the clipboard still holds that item. Marking an item normal is done in the window ("Mark normal").
 - **Force-save** captures the current clipboard even while capture is paused or the app is excluded. It still refuses content a password manager marked with the Windows opt-out formats.
 
 ## Out of scope for this version
@@ -176,7 +182,24 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-Add `ui` to the extras (`".[dev,ui]"`) to install PySide6 as well. It is large and is not needed until the window is built.
+Add `ui` to the extras (`".[dev,ui]"`) to install PySide6 as well. It is needed to run the app and the window tests (they are skipped without it).
+
+To run the app:
+
+```powershell
+.\.venv\Scripts\python.exe -m smartclip
+```
+
+The window opens at start. Closing it only hides it; `Ctrl+Alt+V` opens it again and its **Quit** button stops the app. Starting a second copy shows a message and exits. If the duplicate-detection key file cannot be read, the app does not start and tells you which file it is; it never replaces the file itself. There is no tray icon yet, so the pause state is only shown in the window.
+
+## Using the window
+
+- Type to search. Every word must appear in the item's text or source app. Up and Down move the selection, Enter copies the selected item back, Esc clears the search or hides the window.
+- Click a type badge (or the "Secret" / "Review?" badge) to show only those items; click the filter's "x" to clear it.
+- Secret and unsure items show as bullets. They are never matched by a search, and while you type a search they are left out of the results. Click the bullets (or press Ctrl+R) to reveal one for 10 seconds; it is masked again when the time is up or the window hides.
+- Copying a secret or unsure item back uses the safe copy-back (kept out of Win+V where honored, cleared after 30 seconds) and does not reveal it. The window hides after a copy.
+- The window hides when you switch to another app, and every revealed item is masked again.
+- Ctrl+P pins or unpins a normal item. Shift+Del deletes the selected item after asking.
 
 ## Roadmap
 
