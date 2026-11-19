@@ -36,7 +36,14 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m smartclip
 ```
 
-The window opens at start. Closing it only hides it; quit from the "..." menu at the top of the window. Only one copy runs at a time. There is no tray icon or autostart yet.
+The window opens at start. Closing it only hides it; quit from the "..." menu at the top of the window. Only one copy runs at a time.
+
+**Run it without a terminal.** In the window's top "..." menu, tick:
+
+- **Start with Windows:** starts the app hidden at every login (`Ctrl+Alt+V` opens it). It adds a per-user startup entry; no admin rights.
+- **Start menu shortcut:** adds "Smart Clipboard" to your Start menu to start it by hand.
+
+Both use this install's `pythonw.exe`, so no console window appears. If you move the project folder, untick and tick them again. There is no tray icon or packaged `.exe` yet.
 
 ## Using it
 

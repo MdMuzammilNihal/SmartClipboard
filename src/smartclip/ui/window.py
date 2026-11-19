@@ -69,6 +69,7 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
+    QAction,
     QColor,
     QCursor,
     QFont,
@@ -155,6 +156,15 @@ class WindowBackend(Protocol):
     def is_paused(self) -> bool: ...
     def toggle_pause(self) -> bool: ...
     def quit(self) -> None: ...
+
+
+class Switch(Protocol):
+    """An on/off setting shown as a tick-box item in the "..." menu (autostart.py)."""
+
+    label: str
+
+    def is_on(self) -> bool: ...
+    def set_on(self, on: bool) -> bool: ...
 
 
 def _utc_now() -> datetime:
@@ -490,6 +500,7 @@ class SearchWindow(QWidget):
         active_window: Callable[[], QWidget | None] = QApplication.activeWindow,
         paster: Paster | None = None,
         current_theme: Callable[[], themes.Theme] = themes.current_theme,
+        switches: list[Switch] | None = None,
     ) -> None:
         super().__init__()
         self._backend = backend
@@ -531,6 +542,17 @@ class SearchWindow(QWidget):
         self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         more_menu = QMenu(self)
         self.pause_action = more_menu.addAction("Pause capture", self.toggle_pause)
+        self.switch_actions = []
+        if switches:
+            more_menu.addSeparator()
+        for switch in switches or []:
+            action = more_menu.addAction(switch.label)
+            action.setCheckable(True)
+            action.triggered.connect(
+                lambda checked, sw=switch, act=action: self._set_switch(sw, act, checked)
+            )
+            self.switch_actions.append((switch, action))
+        more_menu.aboutToShow.connect(self.sync_switches)
         more_menu.addSeparator()
         self.quit_action = more_menu.addAction("Quit Smart Clipboard", self._backend.quit)
         self.more_button.setMenu(more_menu)
@@ -898,6 +920,17 @@ class SearchWindow(QWidget):
     def toggle_pause(self) -> None:
         self._backend.toggle_pause()
         self.refresh()
+
+    def sync_switches(self) -> None:
+        """Tick each switch item to match the real setting (read when the menu opens)."""
+        for switch, action in self.switch_actions:
+            action.setChecked(switch.is_on())
+
+    def _set_switch(self, switch: Switch, action: QAction, on: bool) -> None:
+        if not switch.set_on(on):
+            self.status_label.setText(f"Could not change \"{switch.label}\"")
+            self.status_label.setVisible(True)
+        action.setChecked(switch.is_on())
 
     # --- Keys ---
 

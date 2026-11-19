@@ -346,6 +346,7 @@ def main() -> int:
     from PySide6.QtCore import QObject, QTimer, Signal
     from PySide6.QtWidgets import QApplication, QMessageBox
 
+    from smartclip.autostart import BACKGROUND_FLAG, AutostartSwitch, ShortcutSwitch
     from smartclip.hotkeys import HotkeyError, HotkeyListener, parse_hotkey
     from smartclip.listener import ClipboardListener, ListenerError
     from smartclip.storage import Store
@@ -407,7 +408,11 @@ def main() -> int:
         labeled_log=labeled_log,
     )
     backend.cleanup()
-    window = SearchWindow(backend, paster=Paster() if config.PASTE_ON_CHOOSE else None)
+    window = SearchWindow(
+        backend,
+        paster=Paster() if config.PASTE_ON_CHOOSE else None,
+        switches=[AutostartSwitch(), ShortcutSwitch()],
+    )
 
     class HotkeyBridge(QObject):
         """Carries hotkey presses from the hotkey thread to the Qt thread."""
@@ -458,9 +463,14 @@ def main() -> int:
     cleanup_timer.timeout.connect(run_cleanup)
     cleanup_timer.start(int(config.CLEANUP_INTERVAL.total_seconds() * 1000))
 
-    # With no tray icon yet, the window opens at start so it is clear the app runs.
-    window.show_and_focus()
-    logsafe.log_event(_log, "app_started", hotkeys_taken=len(taken))
+    # Started by hand, the window opens so it is clear the app runs. Started
+    # at login (autostart.py passes --background), it stays hidden until
+    # Ctrl+Alt+V. With no tray icon yet, a hotkey clash is then only shown
+    # when the window is opened.
+    background = BACKGROUND_FLAG in sys.argv[1:]
+    if not background:
+        window.show_and_focus()
+    logsafe.log_event(_log, "app_started", hotkeys_taken=len(taken), background=background)
     try:
         return qt_app.exec()
     finally:

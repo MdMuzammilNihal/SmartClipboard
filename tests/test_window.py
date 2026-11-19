@@ -610,3 +610,49 @@ def test_focus_check_on_hidden_window_does_nothing(qapp: QApplication, backend: 
     win = SearchWindow(backend, active_window=lambda: None)
     win.hide_if_focus_left()
     assert not win.isVisible()
+
+
+# --- Switches in the "..." menu (autostart.py) ---
+
+
+class FakeSwitch:
+    def __init__(self, label: str, works: bool = True) -> None:
+        self.label = label
+        self.on = False
+        self.works = works
+
+    def is_on(self) -> bool:
+        return self.on
+
+    def set_on(self, on: bool) -> bool:
+        if self.works:
+            self.on = on
+        return self.works
+
+
+def test_switches_are_tick_boxes_that_follow_the_setting(
+    qapp: QApplication, backend: FakeBackend
+) -> None:
+    autostart_switch = FakeSwitch("Start with Windows")
+    win = SearchWindow(backend, switches=[autostart_switch])
+    [(switch, action)] = win.switch_actions
+    assert action.text() == "Start with Windows" and action.isCheckable()
+    win.sync_switches()
+    assert not action.isChecked()
+    action.trigger()  # ticks it
+    assert autostart_switch.on is True and action.isChecked()
+    autostart_switch.on = False  # changed outside the app
+    win.sync_switches()
+    assert not action.isChecked()
+
+
+def test_failed_switch_says_so_and_stays_unticked(
+    qapp: QApplication, backend: FakeBackend
+) -> None:
+    win = SearchWindow(backend, switches=[FakeSwitch("Start menu shortcut", works=False)])
+    win.show_and_focus()
+    [(_switch, action)] = win.switch_actions
+    action.trigger()
+    assert not action.isChecked()
+    assert win.status_label.text() == 'Could not change "Start menu shortcut"'
+    win.hide()
