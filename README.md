@@ -11,7 +11,7 @@ A local, privacy-focused smart clipboard for Windows. It watches what you copy, 
 | Part | State |
 |---|---|
 | Repository, pinned dependencies, package skeleton | Done |
-| Test that fails if app code imports a networking module | Done |
+| No network access (task 13) | Checked by automated tests: app code imports no networking module, and the app's flows, run with fake data, open no socket except loopback ones inside the process (see [Network](#network)). Manual check on the owner's Windows 11 machine (2026-11-19, fake text): no network connections seen while the app was used |
 | Encrypted storage (DPAPI + SQLite), with tests | Written and tested; not yet connected to a listener |
 | Logging that refuses clipboard content, with tests | Written and tested |
 | Clipboard listener (own thread, busy-retry, merging of repeated events) | Written; tested with a fake clipboard, real window messages, and opt-in tests that write fake text to the real clipboard (passing on the owner's Windows 11 machine). Passes every change through the privacy gate. Not yet connected to storage, and not yet confirmed against real copies from other apps |
@@ -123,11 +123,65 @@ Other limits you should know:
 
 ## Privacy rules the code follows
 
-- **No network access.** No cloud APIs, telemetry, update checks, or analytics. A test fails if app code imports a networking module. That test is a static check of this project's own import statements: it does not catch dynamic imports and does not inspect what third-party dependencies do internally, so it is a guard against accidents, not proof.
+- **No network access.** No cloud APIs, telemetry, update checks, or analytics. What has been checked, and what has not, is in [Network](#network).
 - **Clipboard content is never logged.** Logs may contain IDs, content types, lengths, and timestamps only. This includes error messages and crash output. The logging module enforces this: it refuses free-text values, discards ordinary logging calls, and records only the class name of an exception, never its message. It cannot stop a stray `print()` or control what third-party libraries print.
 - **Only app names are stored as context,** never window titles.
 - **Tests use fake data only.**
 - **Pause mode** stops capture entirely, with a visible indicator.
+
+## Network
+
+The app is meant to make no network calls at all: no cloud APIs, telemetry, update checks, or analytics. This is what has been checked, and how.
+
+**Automated checks** (`tests/test_no_network.py`, run with the rest of the tests):
+
+1. **Imports.** The test reads every source file of the app and fails if one imports a networking module (`socket`, `ssl`, `http`, `urllib`, `requests`, Qt's `QtNetwork` and web modules, and others).
+2. **Running the app's flows.** The test starts a fresh Python process (`tests/no_network_probe.py`) that installs a Python audit hook first, then imports every app module and runs the app's flows with fake text: the clipboard listener started and stopped with capture paused, file logging, the DPAPI-protected key and encrypted database in a temporary folder, capture, duplicate merging, copy-back requests, mark secret and normal, pin, delete, cleanup, the search window drawn off-screen, and Win+V removal through the real Windows Runtime code path (with the history listing replaced, so your real Win+V history is not read). The test fails if Python looks up a host name, uses `urllib`, `http.client`, or similar, or binds or connects a socket to any address other than this machine's loopback address. It also fails if an unexpected networking module is loaded.
+
+What the second check found:
+
+- **Loopback sockets inside the process.** Every Win+V removal opens and closes a pair of connected sockets on `127.0.0.1`. They come from Python's `asyncio`, which `winhistory.py` uses to wait for the Windows Runtime calls: on Windows, `asyncio` makes this socket pair as its internal wake-up signal. The traffic stays inside the machine and is between the app and itself. No other socket is opened.
+- **Loaded but not used.** `socket` and `selectors` are loaded by Python's own `logging.handlers` (used for the log file); `asyncio` and `ssl` are loaded by `asyncio` itself (imported by `winhistory.py` and the `winrt` packages). Nothing in the app calls them for networking. No HTTP, URL, or Qt networking module is loaded.
+
+Limits of the automated checks:
+
+- The import check reads import statements only; an import built at run time (`importlib`) would not be caught.
+- The audit hook sees only network use that goes through Python. Code written in C or C++ that talks to the network directly (inside Qt, the Windows Runtime, `pywin32`, or Windows itself) is invisible to it. One known case of the last kind: on a PC joined to a work domain, Windows' DPAPI may contact the domain controller to back up its keys. That is Windows, not this app, and it does not send clipboard content.
+- The flows run with fakes in place of the real clipboard writes, and real hotkey presses are not covered.
+
+So these checks guard against mistakes; they are not proof.
+
+**Manual check on a real machine:** done on the owner's Windows 11 machine on 2026-11-19, with fake text and a throwaway data folder, following the steps below. Both of the app's processes were polled every second for 3 minutes with `Get-NetTCPConnection` and `Get-NetUDPEndpoint` while fake text was copied (including a fake token, so the clipboard clear and Win+V removal ran), and the window was used to search, re-copy, and mark items. No TCP connection or UDP endpoint was seen at any point. Limits: polling once a second can miss a connection that lasts less than a second (the loopback pair above is one), so this shows there was no lasting connection, not that no packet was ever sent; it covered one session of a few minutes.
+
+### Checking it yourself
+
+Use fake text only, and a throwaway data folder so nothing lands in your real history. In PowerShell, from the repository folder:
+
+1. Start the app with a throwaway data folder:
+
+   ```powershell
+   $env:LOCALAPPDATA = "$env:TEMP\smartclip-netcheck"
+   .\.venv\Scripts\python.exe -m smartclip
+   ```
+
+2. In a second PowerShell window, find the app's processes. The virtual environment's `python.exe` starts a second Python process, so expect two:
+
+   ```powershell
+   $ids = (Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object CommandLine -like '*smartclip*').ProcessId
+   $ids
+   ```
+
+3. Watch their network connections for two minutes (one line printed per connection found):
+
+   ```powershell
+   1..120 | ForEach-Object { Get-NetTCPConnection -OwningProcess $ids -ErrorAction SilentlyContinue; Get-NetUDPEndpoint -OwningProcess $ids -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1 }
+   ```
+
+4. While it runs, use the app with fake text: resume capture if it is paused, copy a few fake lines from Notepad, copy a fake token such as `ghp_` followed by 36 `F` characters (this triggers the clear and the Win+V removal about 30 seconds later), open the window with `Ctrl+Alt+V`, search, re-copy an item, and mark one secret.
+5. Optionally, open Resource Monitor (`resmon`), go to the Network tab, tick the `python.exe` processes from step 2, and watch "Network Activity" and "TCP Connections" while repeating step 4.
+6. Quit the app with the window's **Quit** button, and delete the `smartclip-netcheck` folder in `%TEMP%`.
+
+Expected: no connections at all, except possibly a short-lived `127.0.0.1` pair during a Win+V removal (it lasts milliseconds, so it is rarely seen). Any remote address, or anything listening on `0.0.0.0` or `::`, is a bug.
 
 ## Storage and retention
 
