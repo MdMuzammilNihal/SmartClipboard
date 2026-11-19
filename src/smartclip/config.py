@@ -87,6 +87,11 @@ VACUUM_INTERVAL = timedelta(days=1)
 # sooner if the window hides.
 REVEAL_DURATION = timedelta(seconds=10)
 
+# Choosing an item in the window pastes it into the app that was in front
+# when the window opened, as Win+V does (owner's decision 2026-11-19; see
+# ui/paste.py). False: choosing only copies it, and you press Ctrl+V.
+PASTE_ON_CHOOSE = True
+
 # Keep the search window out of screenshots, recordings, and screen sharing
 # (see ui/capture_guard.py). Set to False to take screenshots of it.
 EXCLUDE_FROM_SCREEN_CAPTURE = True

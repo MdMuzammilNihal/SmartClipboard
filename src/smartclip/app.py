@@ -34,6 +34,10 @@ SECURITY REVIEW (owner):
 - Only one copy runs at a time (a named mutex, config.SINGLE_INSTANCE_NAME),
   so two copies never capture into the same database. A second copy shows
   a message and exits before it opens anything.
+- Choosing an item in the window pastes it into the app that was in front
+  (owner's decision 2026-11-19, config.PASTE_ON_CHOOSE; checks in
+  ui/paste.py): only if that same window is back in front, the copy-back
+  was written, and no modifier key is held.
 - Every window the app shows (the search window and its tooltips, menus,
   and dialogs) is kept out of screen capture (ui/capture_guard.py) unless
   config.EXCLUDE_FROM_SCREEN_CAPTURE is False.
@@ -346,6 +350,7 @@ def main() -> int:
     from smartclip.listener import ClipboardListener, ListenerError
     from smartclip.storage import Store
     from smartclip.ui import capture_guard
+    from smartclip.ui.paste import Paster
     from smartclip.ui.window import SearchWindow
     from smartclip.winhistory import HistoryCleaner
 
@@ -402,7 +407,7 @@ def main() -> int:
         labeled_log=labeled_log,
     )
     backend.cleanup()
-    window = SearchWindow(backend)
+    window = SearchWindow(backend, paster=Paster() if config.PASTE_ON_CHOOSE else None)
 
     class HotkeyBridge(QObject):
         """Carries hotkey presses from the hotkey thread to the Qt thread."""

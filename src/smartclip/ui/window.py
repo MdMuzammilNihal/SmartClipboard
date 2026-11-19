@@ -1,19 +1,27 @@
-"""The search-first window (tasks 9 and 10), drawn with PySide6.
+"""The clipboard window (tasks 9 and 10), drawn with PySide6 in a Win+V style.
 
-Layout: a search box on top (focused whenever the window opens), the active
-badge filter and the pause indicator under it, then one table row per item:
-type badge, state badge ("Secret" / "Review?"), preview, source app, age,
-and a star for pinned items. Buttons at the bottom act on the selected row.
+Owner's decisions (2026-11-19): a narrow panel that opens next to the mouse
+pointer, one card per item, choosing an item pastes it into the app that
+was in front (ui/paste.py; copy only if no Paster is given), item actions
+in a card menu and on right-click, and light or dark colours following
+Windows (ui/theme.py).
+
+Layout, top to bottom: the search box (focused whenever the window opens)
+with the pause and "more" buttons, a "Capture paused" banner while paused,
+a row of filter chips (All, then each badge present in the history), then
+the cards. Each card shows the type badge, the state badge ("Secret" /
+"Review?"), the source app, the age, a pin mark, a "..." menu button, and
+up to three lines of the item's text.
 
 Mouse and keys:
-- Type in the search box to search. Up and Down move the selection, Enter
-  copies the selected item back, Esc clears the search or hides the window.
-- Click a type or state badge to filter by it; click the filter's "x" to
-  clear it.
-- Click a masked preview to reveal it for 10 seconds (Ctrl+R does the same
-  for the selected row); click again to mask it.
-- Double-click a row to copy it back. Ctrl+P pins or unpins, Shift+Del
-  deletes (after a confirmation).
+- Click a card (or press Enter) to paste it. Up and Down move the
+  selection, Esc clears the search or hides the window.
+- Click a card's type or state badge, or a chip, to filter by it.
+- Click a masked text to reveal it for 10 seconds (Ctrl+R does the same for
+  the selected card); click it again to mask it.
+- The "..." button, a right-click, or Shift+F10 opens the card menu: paste,
+  copy only, reveal, pin, mark normal, mark secret, delete. Ctrl+P pins or
+  unpins, Shift+Del deletes (after a confirmation).
 
 The window never touches the database or the clipboard itself. It calls a
 WindowBackend (app.py), which runs on the same (UI) thread.
@@ -21,59 +29,86 @@ WindowBackend (app.py), which runs on the same (UI) thread.
 SECURITY REVIEW (owner):
 
 - What is shown, masked, and searchable is decided in view_model.py; see its
-  docstring. This file only draws those rows.
+  docstring. This file only draws those rows. The list model hands out the
+  row's preview only, which is the bullet mask for masked items.
 - Every reveal is masked again when the window hides (hideEvent), and a
   one-second timer masks reveals whose 10 seconds are up while it is open.
-- Copying a masked item back does not reveal it. app.py sends secret and
-  unsure items through the safe copy-back (opt-out formats, cleared after 30
-  seconds).
-- After a copy the window hides, so a revealed secret is not left on screen.
+- Choosing a masked item pastes it without revealing it. app.py sends
+  secret and unsure items through the safe copy-back (opt-out formats,
+  cleared after 30 seconds). The paste itself has its own checks (paste.py).
+- After a paste or copy the window hides, so a revealed secret is not left
+  on screen.
 - Deleting asks for confirmation; the question never quotes the item.
-- The window hides as soon as another app takes the focus (as Win+V does),
-  so the list, and any revealed item, is not left on top of other work.
-  Its own dialogs (the delete question) do not count as leaving.
-- Known limit: while an item is revealed, its preview is ordinary widget
-  text, readable by screen readers and UI automation tools like any other
-  window text. Masked items expose only the bullets.
+- The window hides as soon as another app takes the focus (as Win+V does).
+  Its own dialogs and menus do not count as leaving.
+- Tooltips are fixed hints; they never show an item's text.
+- Known limit: while an item is revealed, its text is drawn on screen and
+  is exposed to accessibility tools like any other window text. Masked
+  items expose only the bullets.
 - Not checked on the real machine yet: that the window comes to the front
   when the hotkey is pressed while another app is in front (Windows limits
-  which apps may take focus).
+  which apps may take focus), and how it looks there.
 """
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
 
 from PySide6.QtCore import (
-    QAbstractTableModel,
+    QAbstractListModel,
     QEvent,
     QModelIndex,
     QObject,
     QPersistentModelIndex,
-    QRectF,
+    QPoint,
+    QRect,
+    QSize,
     Qt,
     QTimer,
+    Signal,
 )
-from PySide6.QtGui import QColor, QKeySequence, QPainter, QShortcut
+from PySide6.QtGui import (
+    QColor,
+    QCursor,
+    QFont,
+    QFontMetrics,
+    QGuiApplication,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QShortcut,
+    QTextLayout,
+    QTextOption,
+)
 from PySide6.QtWidgets import (
-    QApplication,
     QAbstractItemView,
+    QApplication,
+    QFrame,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
+    QListView,
+    QMenu,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
-    QTableView,
+    QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
 
-from smartclip.labels import SecretState
+from smartclip.labels import Label, SecretState
 from smartclip.storage import StoredItem
+from smartclip.ui import theme as themes
+from smartclip.ui.paste import Paster
 from smartclip.ui.view_model import (
+    LABEL_BADGES,
+    STATE_BADGES,
     Badge,
     Filter,
     RevealState,
@@ -82,13 +117,29 @@ from smartclip.ui.view_model import (
     filter_name,
 )
 
-COL_TYPE, COL_STATE, COL_PREVIEW, COL_SOURCE, COL_AGE, COL_PIN = range(6)
-_HEADERS = ("Type", "", "Item", "Source", "Age", "")
-# The role under which badge columns hand their Badge to the delegate.
-BADGE_ROLE = Qt.ItemDataRole.UserRole + 1
-# Ages are redrawn this often while the window is open.
+WINDOW_SIZE = QSize(380, 520)
+# The role under which the model hands the whole Row to the delegate.
+ROW_ROLE = Qt.ItemDataRole.UserRole + 1
+# Ages are redrawn this often (in seconds) while the window is open.
 _AGE_REFRESH_TICKS = 30
+MAX_BODY_LINES = 3
 DELETE_QUESTION = "Delete this item? This cannot be undone."
+EMPTY_TEXT = "Nothing here yet. Copy some text and it will show up here."
+NO_MATCH_TEXT = "No matching items."
+REVEAL_HINT = "Click to reveal"
+HIDE_HINT = "Click to hide"
+
+# Card geometry, in pixels.
+_OUTER_X, _OUTER_Y, _PAD, _GAP, _BADGE_PAD_X = 8, 4, 10, 6, 7
+
+# Icon glyphs from the Windows icon fonts (Windows 11, then Windows 10).
+_ICON_FONTS = ["Segoe Fluent Icons", "Segoe MDL2 Assets"]
+_GLYPH_PAUSE, _GLYPH_PLAY, _GLYPH_MORE, _GLYPH_PIN = "", "", "", ""
+
+# Regions of a card that react to a click.
+REGION_CARD, REGION_LABEL, REGION_STATE, REGION_MENU, REGION_TEXT = (
+    "card", "label", "state", "menu", "text",
+)
 
 
 class WindowBackend(Protocol):
@@ -115,8 +166,136 @@ def _ask_delete(parent: QWidget) -> bool:
     return answer == QMessageBox.StandardButton.Yes
 
 
-class RowsModel(QAbstractTableModel):
-    """Holds the current rows for the table view."""
+def place_near(pointer: QPoint, size: QSize, area: QRect, offset: int = 8) -> QPoint:
+    """Top-left corner for a window of `size` next to `pointer`, kept inside `area`.
+
+    Below and to the right of the pointer when it fits, otherwise flipped
+    above or to the left, and always clamped to the screen area.
+    """
+    x = pointer.x() + offset
+    y = pointer.y() + offset
+    if x + size.width() > area.right() + 1:
+        x = pointer.x() - offset - size.width()
+    if y + size.height() > area.bottom() + 1:
+        y = pointer.y() - offset - size.height()
+    x = max(area.left(), min(x, area.right() + 1 - size.width()))
+    y = max(area.top(), min(y, area.bottom() + 1 - size.height()))
+    return QPoint(x, y)
+
+
+def wrap_lines(text: str, font: QFont, width: int, max_lines: int) -> list[str]:
+    """Break `text` into at most `max_lines` lines of `width`; elide the last if cut."""
+    if not text or width <= 0:
+        return [text]
+    metrics = QFontMetrics(font)
+    layout = QTextLayout(text, font)
+    option = QTextOption()
+    option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+    layout.setTextOption(option)
+    lines: list[str] = []
+    layout.beginLayout()
+    while True:
+        line = layout.createLine()
+        if not line.isValid():
+            break
+        line.setLineWidth(width)
+        start = line.textStart()
+        if len(lines) == max_lines - 1:
+            rest = text[start:]
+            lines.append(metrics.elidedText(rest, Qt.TextElideMode.ElideRight, width))
+            break
+        lines.append(text[start : start + line.textLength()].rstrip())
+    layout.endLayout()
+    return lines or [text]
+
+
+@dataclass(frozen=True)
+class CardRects:
+    """Where each part of one card is drawn, in the list's coordinates."""
+
+    card: QRect
+    label: QRect | None  # None when the state badge already says it all
+    state: QRect | None
+    menu: QRect
+    pin: QRect | None
+    top_text: QRect  # source app and age, between the badges and the icons
+    body: QRect
+    text: QRect | None  # the clickable masked or revealed text
+
+
+def _badge_width(badge: Badge, metrics: QFontMetrics) -> int:
+    return metrics.horizontalAdvance(badge.text) + 2 * _BADGE_PAD_X
+
+
+def card_rects(rect: QRect, row: Row, metrics: QFontMetrics) -> CardRects:
+    """Lay out one card inside the list cell `rect`."""
+    card = rect.adjusted(_OUTER_X, _OUTER_Y, -_OUTER_X, -_OUTER_Y)
+    inner = card.adjusted(_PAD, _PAD, -_PAD, -_PAD)
+    badge_height = metrics.height() + 4
+    label = None
+    right_of_badges = inner.left() - 5
+    if show_label_badge(row):
+        label = QRect(inner.left(), inner.top(), _badge_width(row.label_badge, metrics), badge_height)
+        right_of_badges = label.right()
+    state = None
+    if row.state_badge is not None:
+        state = QRect(
+            right_of_badges + 5, inner.top(), _badge_width(row.state_badge, metrics), badge_height
+        )
+        right_of_badges = state.right()
+    menu = QRect(inner.right() - badge_height + 1, inner.top(), badge_height, badge_height)
+    pin = None
+    right_edge = menu.left() - 2
+    if row.pinned:
+        pin = QRect(menu.left() - badge_height - 2, inner.top(), badge_height, badge_height)
+        right_edge = pin.left() - 2
+    top_text = QRect(
+        right_of_badges + 8, inner.top(), max(0, right_edge - right_of_badges - 8), badge_height
+    )
+    body = QRect(
+        inner.left(),
+        inner.top() + badge_height + _GAP,
+        inner.width(),
+        max(0, inner.bottom() - inner.top() - badge_height - _GAP + 1),
+    )
+    text = None
+    if row.masked:
+        hint_width = metrics.horizontalAdvance(f"{row.preview}   {REVEAL_HINT}")
+        text = QRect(body.left(), body.top(), min(hint_width, body.width()), metrics.lineSpacing())
+    elif row.revealed:
+        text = body
+    return CardRects(card, label, state, menu, pin, top_text, body, text)
+
+
+def show_label_badge(row: Row) -> bool:
+    """False for a "possible secret" label next to a Secret or Review? badge (same news)."""
+    return not (row.label is Label.POSSIBLE_SECRET and row.state_badge is not None)
+
+
+def region_at(rects: CardRects, point: QPoint) -> str:
+    """Which part of a card a click at `point` landed on."""
+    if rects.menu.contains(point):
+        return REGION_MENU
+    if rects.label is not None and rects.label.contains(point):
+        return REGION_LABEL
+    if rects.state is not None and rects.state.contains(point):
+        return REGION_STATE
+    if rects.text is not None and rects.text.contains(point):
+        return REGION_TEXT
+    return REGION_CARD
+
+
+def card_height(row: Row, font: QFont, width: int) -> int:
+    """The height of one list cell holding this row's card."""
+    metrics = QFontMetrics(font)
+    body_width = width - 2 * _OUTER_X - 2 * _PAD
+    lines = 1 if row.masked else len(wrap_lines(row.preview, font, body_width, MAX_BODY_LINES))
+    badge_height = metrics.height() + 4
+    return 2 * _OUTER_Y + 2 * _PAD + badge_height + _GAP + lines * metrics.lineSpacing()
+
+
+class CardsModel(QAbstractListModel):
+    """Holds the current rows for the list view."""
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -137,53 +316,40 @@ class RowsModel(QAbstractTableModel):
     def rowCount(self, parent: QModelIndex | QPersistentModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._rows)
 
-    def columnCount(self, parent: QModelIndex | QPersistentModelIndex = QModelIndex()) -> int:
-        return 0 if parent.isValid() else len(_HEADERS)
-
-    def headerData(
-        self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole
-    ) -> object:
-        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return _HEADERS[section]
-        return None
-
     def data(
         self, index: QModelIndex | QPersistentModelIndex, role: int = Qt.ItemDataRole.DisplayRole
     ) -> object:
         row = self.row_at(index.row())
         if row is None:
             return None
-        column = index.column()
-        if role == BADGE_ROLE:
-            if column == COL_TYPE:
-                return row.label_badge
-            if column == COL_STATE:
-                return row.state_badge
-            return None
-        if role == Qt.ItemDataRole.DisplayRole:
-            if column == COL_TYPE:
-                return row.label_badge.text
-            if column == COL_STATE:
-                return row.state_badge.text if row.state_badge else ""
-            if column == COL_PREVIEW:
-                return row.preview
-            if column == COL_SOURCE:
-                return row.source_app
-            if column == COL_AGE:
-                return row.age
-            if column == COL_PIN:
-                return "★" if row.pinned else ""
-        if role == Qt.ItemDataRole.ToolTipRole:
-            # Fixed hints only; never the item's text.
-            if column in (COL_TYPE, COL_STATE) and self.data(index, BADGE_ROLE):
-                return "Click to filter by this badge"
-            if column == COL_PREVIEW and (row.masked or row.revealed):
-                return "Click to hide" if row.revealed else "Click to reveal for 10 seconds"
+        if role == ROW_ROLE:
+            return row
+        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.AccessibleTextRole):
+            # The bullet mask for masked rows; the text itself never leaves here.
+            return row.preview
         return None
 
 
-class BadgeDelegate(QStyledItemDelegate):
-    """Paints a Badge as a rounded coloured tag."""
+class CardDelegate(QStyledItemDelegate):
+    """Draws a Row as a card and reports which part of it was clicked."""
+
+    region_clicked = Signal(int, str, QPoint)  # list row, region, global position
+
+    def __init__(self, view: QListView) -> None:
+        super().__init__(view)
+        self._view = view
+        self.theme = themes.LIGHT
+        self.icon_font = QFont()
+        self.icon_font.setFamilies(_ICON_FONTS)
+
+    def sizeHint(  # noqa: N802 (Qt name)
+        self, option: QStyleOptionViewItem, index: QModelIndex | QPersistentModelIndex
+    ) -> QSize:
+        row = index.data(ROW_ROLE)
+        width = self._view.viewport().width()
+        if not isinstance(row, Row):
+            return QSize(width, 0)
+        return QSize(width, card_height(row, option.font, width))
 
     def paint(
         self,
@@ -191,27 +357,125 @@ class BadgeDelegate(QStyledItemDelegate):
         option: QStyleOptionViewItem,
         index: QModelIndex | QPersistentModelIndex,
     ) -> None:
-        badge = index.data(BADGE_ROLE)
-        if not isinstance(badge, Badge):
-            super().paint(painter, option, index)
+        row = index.data(ROW_ROLE)
+        if not isinstance(row, Row):
             return
+        t = self.theme
+        metrics = option.fontMetrics
+        rects = card_rects(option.rect, row, metrics)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        metrics = option.fontMetrics
-        width = metrics.horizontalAdvance(badge.text) + 14
-        height = metrics.height() + 4
-        rect = QRectF(
-            option.rect.x() + 4,
-            option.rect.y() + (option.rect.height() - height) / 2,
-            min(width, option.rect.width() - 8),
-            height,
-        )
+
+        background = t.card_selected if selected else t.card_hover if hovered else t.card
+        painter.setBrush(QColor(background))
+        painter.setPen(QPen(QColor(t.accent if selected else t.border), 1))
+        painter.drawRoundedRect(rects.card.adjusted(0, 0, -1, -1), 8, 8)
+
+        if rects.label is not None:
+            self._badge(painter, rects.label, row.label_badge)
+        if rects.state is not None and row.state_badge is not None:
+            self._badge(painter, rects.state, row.state_badge)
+
+        painter.setPen(QColor(t.muted))
+        age_width = metrics.horizontalAdvance(row.age) + 4
+        source_rect = rects.top_text.adjusted(0, 0, -age_width, 0)
+        source = metrics.elidedText(row.source_app, Qt.TextElideMode.ElideRight, source_rect.width())
+        align = Qt.AlignmentFlag.AlignVCenter
+        painter.drawText(source_rect, align | Qt.AlignmentFlag.AlignLeft, source)
+        painter.drawText(rects.top_text, align | Qt.AlignmentFlag.AlignRight, row.age)
+
+        painter.setFont(self.icon_font)
+        center = Qt.AlignmentFlag.AlignCenter
+        if rects.pin is not None:
+            painter.setPen(QColor(t.accent))
+            painter.drawText(rects.pin, center, _GLYPH_PIN)
+        painter.setPen(QColor(t.muted))
+        painter.drawText(rects.menu, center, _GLYPH_MORE)
+        painter.setFont(option.font)
+
+        top_left = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        if row.masked:
+            painter.setPen(QColor(t.text))
+            painter.drawText(rects.body, top_left, row.preview)
+            painter.setPen(QColor(t.muted))
+            hint_x = metrics.horizontalAdvance(row.preview + "   ")
+            painter.drawText(rects.body.adjusted(hint_x, 0, 0, 0), top_left, REVEAL_HINT)
+        else:
+            painter.setPen(QColor(t.text))
+            lines = wrap_lines(row.preview, option.font, rects.body.width(), MAX_BODY_LINES)
+            y = rects.body.top()
+            for line in lines:
+                line_rect = QRect(rects.body.left(), y, rects.body.width(), metrics.lineSpacing())
+                painter.drawText(line_rect, top_left, line)
+                y += metrics.lineSpacing()
+        painter.restore()
+
+    def _badge(self, painter: QPainter, rect: QRect, badge: Badge) -> None:
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(badge.background))
         painter.drawRoundedRect(rect, 6, 6)
         painter.setPen(QColor(badge.foreground))
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, badge.text)
-        painter.restore()
+
+    def editorEvent(  # noqa: N802 (Qt name)
+        self,
+        event: QEvent,
+        model: QAbstractListModel,
+        option: QStyleOptionViewItem,
+        index: QModelIndex | QPersistentModelIndex,
+    ) -> bool:
+        if (
+            event.type() == QEvent.Type.MouseButtonRelease
+            and event.button() == Qt.MouseButton.LeftButton  # type: ignore[attr-defined]
+        ):
+            row = index.data(ROW_ROLE)
+            if isinstance(row, Row):
+                point = event.position().toPoint()  # type: ignore[attr-defined]
+                region = region_at(card_rects(option.rect, row, option.fontMetrics), point)
+                self.region_clicked.emit(
+                    index.row(), region, self._view.viewport().mapToGlobal(point)
+                )
+                return True
+        return super().editorEvent(event, model, option, index)
+
+    def helpEvent(  # noqa: N802 (Qt name)
+        self, event: QEvent, view: QAbstractItemView, option: QStyleOptionViewItem,
+        index: QModelIndex | QPersistentModelIndex,
+    ) -> bool:
+        row = index.data(ROW_ROLE)
+        if not isinstance(row, Row):
+            return False
+        point = event.pos()  # type: ignore[attr-defined]
+        tip = card_tooltip(row, region_at(card_rects(option.rect, row, option.fontMetrics), point))
+        if tip:
+            QToolTip.showText(event.globalPos(), tip, view)  # type: ignore[attr-defined]
+        else:
+            QToolTip.hideText()
+        return True
+
+
+def card_tooltip(row: Row, region: str) -> str:
+    """The fixed hint for a part of a card. Never the item's text."""
+    if region == REGION_LABEL:
+        return f"Show only {row.label_badge.text} items"
+    if region == REGION_STATE and row.state_badge is not None:
+        return f"Show only {row.state_badge.text} items"
+    if region == REGION_MENU:
+        return "More actions"
+    if region == REGION_TEXT:
+        return HIDE_HINT if row.revealed else "Click to reveal for 10 seconds"
+    return ""
+
+
+def present_filters(items: list[StoredItem]) -> list[Filter]:
+    """The chips to offer: secret states, then content types, as found in `items`."""
+    states = {item.payload.secret_state for item in items}
+    labels = {item.payload.label for item in items}
+    found: list[Filter] = [state for state in STATE_BADGES if state in states]
+    found += [label for label in LABEL_BADGES if label in labels]
+    return found
 
 
 class SearchWindow(QWidget):
@@ -224,6 +488,8 @@ class SearchWindow(QWidget):
         reveals: RevealState | None = None,
         confirm_delete: Callable[[QWidget], bool] = _ask_delete,
         active_window: Callable[[], QWidget | None] = QApplication.activeWindow,
+        paster: Paster | None = None,
+        current_theme: Callable[[], themes.Theme] = themes.current_theme,
     ) -> None:
         super().__init__()
         self._backend = backend
@@ -231,127 +497,163 @@ class SearchWindow(QWidget):
         self.reveals = reveals or RevealState()
         self._confirm_delete = confirm_delete
         self._active_window = active_window
+        self._paster = paster
+        self._current_theme = current_theme
         self._filter: Filter | None = None
+        self._chip_filters: list[Filter] = []
         self._ticks = 0
+        self._corners_rounded = False
 
         self.setWindowTitle("Smart Clipboard")
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
-        self.resize(760, 480)
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.resize(WINDOW_SIZE)
 
         self.search = QLineEdit()
+        self.search.setObjectName("search")
         self.search.setPlaceholderText("Search")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self.refresh)
         self.search.installEventFilter(self)
 
-        self.filter_label = QLabel()
-        self.clear_filter_button = QPushButton("×")
-        self.clear_filter_button.setFixedWidth(24)
-        self.clear_filter_button.setToolTip("Clear the filter")
-        self.clear_filter_button.clicked.connect(lambda: self.set_filter(None))
-        self.pause_label = QLabel("Capture paused")
-        self.pause_label.setStyleSheet("color: #c92a2a; font-weight: bold;")
-        self.pause_button = QPushButton()
+        icon_font = QFont()
+        icon_font.setFamilies(_ICON_FONTS)
+        self.pause_button = QToolButton()
+        self.pause_button.setFont(icon_font)
         self.pause_button.clicked.connect(self.toggle_pause)
+        self.more_button = QToolButton()
+        self.more_button.setFont(icon_font)
+        self.more_button.setText(_GLYPH_MORE)
+        self.more_button.setToolTip("More")
+        self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        more_menu = QMenu(self)
+        self.pause_action = more_menu.addAction("Pause capture", self.toggle_pause)
+        more_menu.addSeparator()
+        self.quit_action = more_menu.addAction("Quit Smart Clipboard", self._backend.quit)
+        self.more_button.setMenu(more_menu)
+
+        self.pause_label = QLabel("Capture paused: new copies are not saved")
+        self.pause_label.setObjectName("banner")
+
+        self.chips_bar = QWidget()
+        self.chips_bar.setObjectName("chips")
+        self.chips_layout = QHBoxLayout(self.chips_bar)
+        self.chips_layout.setContentsMargins(0, 0, 0, 0)
+        self.chips_layout.setSpacing(6)
+        self.chips: dict[Filter | None, QPushButton] = {}
+        chips_scroll = QScrollArea()
+        chips_scroll.setWidget(self.chips_bar)
+        chips_scroll.setWidgetResizable(True)
+        chips_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # No scroll bar: the mouse wheel scrolls the chips sideways instead.
+        chips_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        chips_scroll.setFixedHeight(30)
+        chips_scroll.viewport().installEventFilter(self)
+        self.chips_scroll = chips_scroll
+        chips_scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        self.model = CardsModel(self)
+        self.list = QListView()
+        self.list.setModel(self.model)
+        self.delegate = CardDelegate(self.list)
+        self.list.setItemDelegate(self.delegate)
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list.setResizeMode(QListView.ResizeMode.Adjust)
+        self.list.setMouseTracking(True)
+        self.list.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # keys go to the search box
+        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._on_context_menu)
+        self.delegate.region_clicked.connect(self._on_region_clicked)
+
+        self.empty_label = QLabel(EMPTY_TEXT)
+        self.empty_label.setObjectName("muted")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setWordWrap(True)
         self.status_label = QLabel()
+        self.status_label.setObjectName("status")
+        self.status_label.setWordWrap(True)
 
-        self.model = RowsModel(self)
-        self.table = QTableView()
-        self.table.setModel(self.model)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setShowGrid(False)
-        self.table.setWordWrap(False)
-        self.table.verticalHeader().hide()
-        self.table.setItemDelegateForColumn(COL_TYPE, BadgeDelegate(self.table))
-        self.table.setItemDelegateForColumn(COL_STATE, BadgeDelegate(self.table))
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(COL_PREVIEW, QHeaderView.ResizeMode.Stretch)
-        for column, width in ((COL_TYPE, 80), (COL_STATE, 76), (COL_SOURCE, 120), (COL_AGE, 44)):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
-            self.table.setColumnWidth(column, width)
-        header.setSectionResizeMode(COL_PIN, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(COL_PIN, 24)
-        self.table.clicked.connect(self._on_clicked)
-        # Enter or a double-click on a row (Windows style) copies it back.
-        self.table.activated.connect(lambda _index: self.copy_selected())
-        self.table.selectionModel().selectionChanged.connect(self._update_buttons)
-
-        self.copy_button = QPushButton("Copy")
-        self.copy_button.clicked.connect(self.copy_selected)
-        self.reveal_button = QPushButton("Reveal")
-        self.reveal_button.clicked.connect(self.toggle_reveal_selected)
-        self.pin_button = QPushButton("Pin")
-        self.pin_button.clicked.connect(self.toggle_pin_selected)
-        self.mark_normal_button = QPushButton("Mark normal")
-        self.mark_normal_button.clicked.connect(self.mark_normal_selected)
-        self.mark_secret_button = QPushButton("Mark secret")
-        self.mark_secret_button.clicked.connect(self.mark_secret_selected)
-        self.delete_button = QPushButton("Delete")
-        self.delete_button.clicked.connect(self.delete_selected)
-        self.quit_button = QPushButton("Quit")
-        self.quit_button.setToolTip("Stop Smart Clipboard")
-        self.quit_button.clicked.connect(self._backend.quit)
-
+        panel = QFrame()
+        panel.setObjectName("panel")
         top = QHBoxLayout()
+        top.setSpacing(4)
         top.addWidget(self.search, 1)
-        top.addWidget(self.pause_label)
         top.addWidget(self.pause_button)
-        filters = QHBoxLayout()
-        filters.addWidget(self.filter_label)
-        filters.addWidget(self.clear_filter_button)
-        filters.addStretch(1)
-        filters.addWidget(self.status_label)
-        buttons = QHBoxLayout()
-        for button in (
-            self.copy_button,
-            self.reveal_button,
-            self.pin_button,
-            self.mark_normal_button,
-            self.mark_secret_button,
-            self.delete_button,
-        ):
-            buttons.addWidget(button)
-        buttons.addStretch(1)
-        buttons.addWidget(self.quit_button)
-        layout = QVBoxLayout(self)
-        layout.addLayout(top)
-        layout.addLayout(filters)
-        layout.addWidget(self.table, 1)
-        layout.addLayout(buttons)
+        top.addWidget(self.more_button)
+        inner = QVBoxLayout(panel)
+        inner.setContentsMargins(10, 10, 10, 8)
+        inner.setSpacing(6)
+        inner.addLayout(top)
+        inner.addWidget(self.pause_label)
+        inner.addWidget(chips_scroll)
+        inner.addWidget(self.list, 1)
+        inner.addWidget(self.empty_label, 1)
+        inner.addWidget(self.status_label)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(panel)
 
+        self.shortcuts: dict[str, QShortcut] = {}
         for keys, action in (
             ("Ctrl+R", self.toggle_reveal_selected),
             ("Ctrl+P", self.toggle_pin_selected),
             ("Shift+Del", self.delete_selected),
+            ("Shift+F10", self.open_menu_for_selected),
+            ("Menu", self.open_menu_for_selected),
         ):
-            QShortcut(QKeySequence(keys), self, activated=action)
+            self.shortcuts[keys] = QShortcut(QKeySequence(keys), self, activated=action)
 
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._tick)
 
+        self.apply_theme()
         self.refresh()
 
     # --- Showing and hiding ---
 
     def show_and_focus(self) -> None:
-        """Open the window fresh: empty search, no filter, search box focused."""
+        """Open the window fresh next to the pointer: empty search, no filter."""
+        if self._paster is not None and not self.isVisible():
+            self._paster.remember()
         self.search.blockSignals(True)
         self.search.clear()
         self.search.blockSignals(False)
         self._filter = None
         self.reveals.hide_all()
+        self.apply_theme()
         self.refresh()
+        self.move_near_pointer()
         self.show()
         self.raise_()
         self.activateWindow()
         self.search.setFocus()
 
+    def apply_theme(self) -> None:
+        """Use the light or dark colours that match Windows right now."""
+        theme = self._current_theme()
+        self.delegate.theme = theme
+        self.setStyleSheet(themes.stylesheet(theme))
+        self.list.viewport().update()
+
+    def move_near_pointer(self) -> None:
+        pointer = QCursor.pos()
+        screen = QGuiApplication.screenAt(pointer) or QGuiApplication.primaryScreen()
+        if screen is not None:
+            self.move(place_near(pointer, self.size(), screen.availableGeometry()))
+
     def showEvent(self, event: QEvent) -> None:  # noqa: N802 (Qt name)
         self._ticks = 0
         self._timer.start()
+        if not self._corners_rounded:
+            self._corners_rounded = True
+            _round_corners(self)
         super().showEvent(event)
 
     def hideEvent(self, event: QEvent) -> None:  # noqa: N802 (Qt name)
@@ -370,7 +672,7 @@ class SearchWindow(QWidget):
 
     def hide_if_focus_left(self) -> None:
         """Hide when no window of this app has the focus any more."""
-        if self.isVisible() and self._active_window() is None:
+        if self.isVisible() and self._active_window() is None and QApplication.activePopupWidget() is None:
             self.hide()
 
     def closeEvent(self, event: QEvent) -> None:  # noqa: N802 (Qt name)
@@ -389,11 +691,10 @@ class SearchWindow(QWidget):
         self.refresh()
 
     def refresh(self) -> None:
-        """Rebuild the rows from the backend, keeping the selected item selected."""
+        """Rebuild the cards from the backend, keeping the selected item selected."""
         selected = self.selected_row()
-        rows = build_rows(
-            self._backend.items(), self.search.text(), self._filter, self.reveals, self._now()
-        )
+        items = self._backend.items()
+        rows = build_rows(items, self.search.text(), self._filter, self.reveals, self._now())
         self.model.set_rows(rows)
         target = 0
         if selected is not None:
@@ -402,41 +703,58 @@ class SearchWindow(QWidget):
                     target = position
                     break
         if rows:
-            self.table.selectRow(target)
-        if self._filter is None:
-            self.filter_label.setText("All items")
-            self.clear_filter_button.hide()
-        else:
-            self.filter_label.setText(f"Filter: {filter_name(self._filter)}")
-            self.clear_filter_button.show()
+            self.list.setCurrentIndex(self.model.index(target))
+        self.list.setVisible(bool(rows))
+        self.empty_label.setVisible(not rows)
+        self.empty_label.setText(EMPTY_TEXT if not items else NO_MATCH_TEXT)
+        self._update_chips(items)
         paused = self._backend.is_paused()
         self.pause_label.setVisible(paused)
-        self.pause_button.setText("Resume" if paused else "Pause")
-        self._update_buttons()
+        self.pause_button.setText(_GLYPH_PLAY if paused else _GLYPH_PAUSE)
+        self.pause_button.setToolTip("Resume capture" if paused else "Pause capture")
+        self.pause_action.setText("Resume capture" if paused else "Pause capture")
+        self.status_label.setVisible(bool(self.status_label.text()))
+
+    def _update_chips(self, items: list[StoredItem]) -> None:
+        wanted = present_filters(items)
+        if self._filter is not None and self._filter not in wanted:
+            wanted.append(self._filter)  # so an active filter can always be cleared
+        if wanted != self._chip_filters:
+            self._chip_filters = wanted
+            for chip in self.chips.values():
+                self.chips_layout.removeWidget(chip)
+                chip.deleteLater()
+            self.chips = {}
+            for active in [None, *wanted]:
+                chip = QPushButton("All" if active is None else filter_name(active))
+                chip.setProperty("chip", True)
+                chip.setCheckable(True)
+                chip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                chip.clicked.connect(lambda _checked=False, f=active: self.set_filter(f))
+                self.chips_layout.addWidget(chip)
+                self.chips[active] = chip
+            self.chips_layout.addStretch(1)
+        for active, chip in self.chips.items():
+            chip.setChecked(active == self._filter)
 
     def selected_row(self) -> Row | None:
-        indexes = self.table.selectionModel().selectedRows()
-        return self.model.row_at(indexes[0].row()) if indexes else None
+        index = self.list.currentIndex()
+        return self.model.row_at(index.row()) if index.isValid() else None
+
+    def select_item(self, item_id: int) -> bool:
+        for position, row in enumerate(self.model.rows):
+            if row.item_id == item_id:
+                self.list.setCurrentIndex(self.model.index(position))
+                return True
+        return False
 
     def _move_selection(self, step: int) -> None:
         count = self.model.rowCount()
         if count == 0:
             return
-        current = self.table.currentIndex().row()
-        self.table.selectRow(max(0, min(count - 1, current + step)))
-
-    def _update_buttons(self) -> None:
-        row = self.selected_row()
-        has_row = row is not None
-        self.copy_button.setEnabled(has_row)
-        self.delete_button.setEnabled(has_row)
-        sensitive = has_row and row.state is not SecretState.NORMAL
-        self.reveal_button.setEnabled(sensitive)
-        self.reveal_button.setText("Hide" if has_row and row.revealed else "Reveal")
-        self.pin_button.setEnabled(has_row and row.can_pin)
-        self.pin_button.setText("Unpin" if has_row and row.pinned else "Pin")
-        self.mark_normal_button.setEnabled(sensitive)
-        self.mark_secret_button.setEnabled(has_row and row.state is not SecretState.SECRET)
+        current = self.list.currentIndex().row()
+        position = max(0, min(count - 1, current + step))
+        self.list.setCurrentIndex(self.model.index(position))
 
     def _tick(self) -> None:
         self._ticks += 1
@@ -444,18 +762,67 @@ class SearchWindow(QWidget):
         if expired or self._ticks % _AGE_REFRESH_TICKS == 0:
             self.refresh()
 
-    # --- Actions ---
+    # --- Clicks and the card menu ---
 
-    def _on_clicked(self, index: QModelIndex) -> None:
-        row = self.model.row_at(index.row())
+    def _on_region_clicked(self, position: int, region: str, global_pos: QPoint) -> None:
+        row = self.model.row_at(position)
+        if row is not None:
+            self.list.setCurrentIndex(self.model.index(position))
+            self.handle_region(row, region, global_pos)
+
+    def handle_region(self, row: Row, region: str, global_pos: QPoint | None = None) -> None:
+        """Act on a click on one part of a card."""
+        if region == REGION_LABEL:
+            self.set_filter(row.label)
+        elif region == REGION_STATE and row.state_badge is not None:
+            self.set_filter(row.state)
+        elif region == REGION_TEXT and (row.masked or row.revealed):
+            self.toggle_reveal(row)
+        elif region == REGION_MENU:
+            self.open_menu(row, global_pos or QCursor.pos())
+        else:
+            self.choose_selected()
+
+    def build_menu(self, row: Row) -> QMenu:
+        """The card menu for one row. Item actions apply to that row."""
+        menu = QMenu(self)
+        sensitive = row.state is not SecretState.NORMAL
+        if self._paster is not None:
+            menu.addAction("Paste", lambda: self.choose(row, paste=True))
+            menu.addAction("Copy only", lambda: self.choose(row, paste=False))
+        else:
+            menu.addAction("Copy", lambda: self.choose(row, paste=False))
+        menu.addSeparator()
+        reveal = menu.addAction("Hide" if row.revealed else "Reveal", lambda: self.toggle_reveal(row))
+        reveal.setEnabled(sensitive)
+        pin = menu.addAction("Unpin" if row.pinned else "Pin", lambda: self.toggle_pin(row))
+        pin.setEnabled(row.can_pin)
+        normal = menu.addAction("Mark normal", lambda: self.mark_normal(row))
+        normal.setEnabled(sensitive)
+        secret = menu.addAction("Mark secret", lambda: self.mark_secret(row))
+        secret.setEnabled(row.state is not SecretState.SECRET)
+        menu.addSeparator()
+        menu.addAction("Delete", lambda: self.delete(row))
+        return menu
+
+    def open_menu(self, row: Row, global_pos: QPoint) -> None:
+        self.build_menu(row).exec(global_pos)
+
+    def open_menu_for_selected(self) -> None:
+        row = self.selected_row()
         if row is None:
             return
-        if index.column() == COL_TYPE:
-            self.set_filter(row.label)
-        elif index.column() == COL_STATE and row.state_badge is not None:
-            self.set_filter(row.state)
-        elif index.column() == COL_PREVIEW and (row.masked or row.revealed):
-            self.toggle_reveal(row)
+        rect = self.list.visualRect(self.list.currentIndex())
+        self.open_menu(row, self.list.viewport().mapToGlobal(rect.center()))
+
+    def _on_context_menu(self, point: QPoint) -> None:
+        index = self.list.indexAt(point)
+        row = self.model.row_at(index.row()) if index.isValid() else None
+        if row is not None:
+            self.list.setCurrentIndex(index)
+            self.open_menu(row, self.list.viewport().mapToGlobal(point))
+
+    # --- Actions ---
 
     def toggle_reveal(self, row: Row) -> None:
         if row.revealed:
@@ -469,19 +836,29 @@ class SearchWindow(QWidget):
         if row is not None:
             self.toggle_reveal(row)
 
-    def copy_selected(self) -> None:
+    def choose_selected(self) -> None:
         row = self.selected_row()
-        if row is None:
-            return
-        if self._backend.copy_back(row.item_id):
+        if row is not None:
+            self.choose(row, paste=True)
+
+    def choose(self, row: Row, paste: bool) -> None:
+        """Copy the item back, and paste it into the previous app if asked and set up."""
+        def copy() -> bool:
+            return self._backend.copy_back(row.item_id)
+
+        if paste and self._paster is not None:
+            ok = self._paster.paste(copy)
+        else:
+            ok = copy()
+        if ok:
             self.status_label.setText("")
             self.hide()
         else:
             self.status_label.setText("Could not copy")
+            self.status_label.setVisible(True)
 
-    def toggle_pin_selected(self) -> None:
-        row = self.selected_row()
-        if row is None or not row.can_pin:
+    def toggle_pin(self, row: Row) -> None:
+        if not row.can_pin:
             return
         if row.pinned:
             self._backend.unpin(row.item_id)
@@ -489,27 +866,34 @@ class SearchWindow(QWidget):
             self._backend.pin(row.item_id)
         self.refresh()
 
-    def mark_normal_selected(self) -> None:
+    def toggle_pin_selected(self) -> None:
         row = self.selected_row()
-        if row is not None and row.state is not SecretState.NORMAL:
+        if row is not None:
+            self.toggle_pin(row)
+
+    def mark_normal(self, row: Row) -> None:
+        if row.state is not SecretState.NORMAL:
             self._backend.mark_normal(row.item_id)
             self.reveals.hide(row.item_id)
             self.refresh()
 
-    def mark_secret_selected(self) -> None:
-        row = self.selected_row()
-        if row is not None and row.state is not SecretState.SECRET:
+    def mark_secret(self, row: Row) -> None:
+        if row.state is not SecretState.SECRET:
             self._backend.mark_secret(row.item_id)
             self.reveals.hide(row.item_id)
             self.refresh()
 
-    def delete_selected(self) -> None:
-        row = self.selected_row()
-        if row is None or not self._confirm_delete(self):
+    def delete(self, row: Row) -> None:
+        if not self._confirm_delete(self):
             return
         self._backend.delete(row.item_id)
         self.reveals.hide(row.item_id)
         self.refresh()
+
+    def delete_selected(self) -> None:
+        row = self.selected_row()
+        if row is not None:
+            self.delete(row)
 
     def toggle_pause(self) -> None:
         self._backend.toggle_pause()
@@ -518,13 +902,17 @@ class SearchWindow(QWidget):
     # --- Keys ---
 
     def keyPressEvent(self, event: QEvent) -> None:  # noqa: N802 (Qt name)
-        # Esc pressed anywhere else in the window (for example the table).
+        # Esc pressed anywhere else in the window.
         if event.key() == Qt.Key.Key_Escape:  # type: ignore[attr-defined]
             self.hide()
             return
         super().keyPressEvent(event)  # type: ignore[arg-type]
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802 (Qt name)
+        if watched is self.chips_scroll.viewport() and event.type() == QEvent.Type.Wheel:
+            bar = self.chips_scroll.horizontalScrollBar()
+            bar.setValue(bar.value() - event.angleDelta().y())  # type: ignore[attr-defined]
+            return True
         if watched is self.search and event.type() == QEvent.Type.KeyPress:
             key = event.key()  # type: ignore[attr-defined]
             if key == Qt.Key.Key_Down:
@@ -534,7 +922,7 @@ class SearchWindow(QWidget):
                 self._move_selection(-1)
                 return True
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                self.copy_selected()
+                self.choose_selected()
                 return True
             if key == Qt.Key.Key_Escape:
                 if self.search.text():
@@ -543,3 +931,18 @@ class SearchWindow(QWidget):
                     self.hide()
                 return True
         return super().eventFilter(watched, event)
+
+
+def _round_corners(window: QWidget) -> None:
+    """Ask Windows 11 to round the frameless window's corners. Ignored elsewhere."""
+    if QGuiApplication.platformName() != "windows":
+        return
+    try:
+        import ctypes
+
+        preference = ctypes.c_int(2)  # DWMWCP_ROUND
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(  # type: ignore[attr-defined]
+            int(window.winId()), 33, ctypes.byref(preference), ctypes.sizeof(preference)
+        )  # 33 = DWMWA_WINDOW_CORNER_PREFERENCE; fails harmlessly before Windows 11
+    except (OSError, AttributeError):
+        pass
