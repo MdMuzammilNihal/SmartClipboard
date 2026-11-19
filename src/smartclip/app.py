@@ -352,6 +352,7 @@ def main() -> int:
     from smartclip.storage import Store
     from smartclip.ui import capture_guard
     from smartclip.ui.paste import Paster
+    from smartclip.ui.prefs import JsonPrefs
     from smartclip.ui.window import SearchWindow
     from smartclip.winhistory import HistoryCleaner
 
@@ -412,6 +413,7 @@ def main() -> int:
         backend,
         paster=Paster() if config.PASTE_ON_CHOOSE else None,
         switches=[AutostartSwitch(), ShortcutSwitch()],
+        prefs=JsonPrefs(config.window_prefs_path()),
     )
 
     class HotkeyBridge(QObject):

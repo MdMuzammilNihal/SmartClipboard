@@ -23,19 +23,27 @@ from PySide6.QtWidgets import QApplication, QMenu, QWidget  # noqa: E402
 from smartclip.labels import Label, SecretState  # noqa: E402
 from smartclip.storage import ItemPayload, StoredItem  # noqa: E402
 from smartclip.ui import theme  # noqa: E402
+from smartclip.ui.prefs import MemoryPrefs, WindowPrefs  # noqa: E402
 from smartclip.ui.view_model import MASK, Row  # noqa: E402
 from smartclip.ui.window import (  # noqa: E402
     EMPTY_TEXT,
     NO_MATCH_TEXT,
     REGION_CARD,
+    REGION_DELETE,
     REGION_LABEL,
+    REGION_MARK,
     REGION_MENU,
+    REGION_PIN,
+    REGION_REVEAL,
     REGION_STATE,
     REGION_TEXT,
     ROW_ROLE,
     SearchWindow,
+    card_buttons,
     card_rects,
+    clear_question,
     card_tooltip,
+    delete_question_box,
     place_near,
     present_filters,
     region_at,
@@ -459,6 +467,16 @@ def test_delete_asks_first(qapp: QApplication, backend: FakeBackend, clock: Cloc
     win.hide()
 
 
+def test_delete_question_stays_above_the_on_top_window(window: SearchWindow) -> None:
+    # The window is always on top; an ordinary dialog could sit behind it.
+    assert window.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+    box = delete_question_box(window)
+    assert box.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+    assert box.parent() is window
+    assert box.windowModality() == Qt.WindowModality.ApplicationModal
+    box.deleteLater()
+
+
 # --- Header: pause and quit ---
 
 
@@ -656,3 +674,171 @@ def test_failed_switch_says_so_and_stays_unticked(
     assert not action.isChecked()
     assert win.status_label.text() == 'Could not change "Start menu shortcut"'
     win.hide()
+
+
+# --- Card buttons (owner's decisions 2026-11-19) ---
+
+
+def test_card_buttons_depend_on_the_state(window: SearchWindow) -> None:
+    assert card_buttons(row_of(window, 1)) == [REGION_PIN, REGION_MARK, REGION_DELETE]
+    assert card_buttons(row_of(window, 3)) == [REGION_REVEAL, REGION_MARK, REGION_DELETE]
+    assert card_buttons(row_of(window, 4)) == [REGION_REVEAL, REGION_MARK, REGION_DELETE]
+
+
+def test_buttons_are_laid_out_only_on_an_active_card(qapp: QApplication) -> None:
+    metrics = QFontMetrics(QFont())
+    row = make_row(pinned=True)
+    still = card_rects(QRect(0, 0, 360, 100), row, metrics)
+    assert still.buttons == () and still.pin is not None
+    active = card_rects(QRect(0, 0, 360, 100), row, metrics, active=True)
+    assert active.pin is None  # the pin button takes the pin mark's place
+    assert [region for region, _rect in active.buttons] == card_buttons(row)
+    for region, rect in active.buttons:
+        assert region_at(active, rect.center()) == region
+        assert not rect.intersects(active.menu)
+        assert not rect.intersects(active.top_text)
+    assert active.top_text.width() < still.top_text.width()
+
+
+def test_button_clicks_act_on_their_card(window: SearchWindow, backend: FakeBackend) -> None:
+    click(window, 1, REGION_PIN)
+    assert row_of(window, 1).pinned
+    click(window, 1, REGION_PIN)
+    assert not row_of(window, 1).pinned
+    click(window, 2, REGION_MARK)
+    assert row_of(window, 2).state is SecretState.SECRET
+    click(window, 3, REGION_REVEAL)
+    assert row_of(window, 3).revealed
+    click(window, 3, REGION_REVEAL)
+    assert row_of(window, 3).masked
+    click(window, 4, REGION_MARK)
+    assert row_of(window, 4).state is SecretState.NORMAL
+    click(window, 1, REGION_DELETE)
+    assert backend.calls[-1] == ("delete", 1)
+
+
+def test_button_delete_still_asks(qapp: QApplication, backend: FakeBackend, clock: Clock) -> None:
+    win = SearchWindow(backend, now=clock, confirm_delete=lambda _parent: False)
+    win.show_and_focus()
+    click(win, 1, REGION_DELETE)
+    assert ("delete", 1) not in backend.calls
+    win.hide()
+
+
+def test_button_tooltips_never_hold_the_text(window: SearchWindow) -> None:
+    for item_id in (1, 3):
+        row = row_of(window, item_id)
+        for region in card_buttons(row):
+            tip = card_tooltip(row, region)
+            assert tip and FAKE_SECRET_TEXT not in tip and "lunch" not in tip
+
+
+# --- Search bar and filters shown or hidden ---
+
+
+def test_hiding_search_and_filters_is_remembered(
+    qapp: QApplication, backend: FakeBackend, clock: Clock
+) -> None:
+    store = MemoryPrefs()
+    win = SearchWindow(backend, now=clock, prefs=store)
+    win.show_and_focus()
+    win.search.setText("lunch")
+    win.show_search_action.trigger()
+    win.show_filters_action.trigger()
+    assert store.prefs == WindowPrefs(show_search=False, show_filters=False)
+    assert not win.search.isVisible() and not win.filters_row.isVisible()
+    assert win.search.text() == ""  # no hidden search left filtering
+    win.hide()
+    again = SearchWindow(backend, now=clock, prefs=store)
+    again.show_and_focus()
+    assert not again.search.isVisible() and not again.filters_row.isVisible()
+    assert not again.show_search_action.isChecked()
+    again.show_search_action.trigger()
+    assert again.search.isVisible() and store.prefs.show_search
+    again.hide()
+    win.deleteLater()
+    again.deleteLater()
+
+
+def test_typing_brings_back_a_hidden_search_bar_for_now(
+    qapp: QApplication, backend: FakeBackend, clock: Clock
+) -> None:
+    store = MemoryPrefs(WindowPrefs(show_search=False))
+    win = SearchWindow(backend, now=clock, prefs=store)
+    win.show_and_focus()
+    assert not win.search.isVisible()
+    QTest.keyClick(win, Qt.Key.Key_Down)
+    assert win.selected_row().item_id == 2
+    QTest.keyClicks(win, "l")
+    assert win.search.isVisible() and win.search.text() == "l"
+    assert store.prefs.show_search is False  # not saved
+    win.hide()
+    assert not win.search.isVisibleTo(win)
+    win.deleteLater()
+
+
+def test_badge_click_brings_back_hidden_filters_for_now(
+    qapp: QApplication, backend: FakeBackend, clock: Clock
+) -> None:
+    win = SearchWindow(backend, now=clock, prefs=MemoryPrefs(WindowPrefs(show_filters=False)))
+    win.show_and_focus()
+    click(win, 1, REGION_LABEL)
+    assert win.active_filter is Label.NOTE and win.filters_row.isVisible()
+    win.hide()
+    win.show_and_focus()
+    assert not win.filters_row.isVisible()
+    win.hide()
+    win.deleteLater()
+
+
+# --- Clear all ---
+
+
+def clear_window(
+    backend: FakeBackend, clock: Clock, answer: bool = True
+) -> tuple[SearchWindow, list[int]]:
+    asked: list[int] = []
+
+    def confirm(_parent: QWidget, count: int) -> bool:
+        asked.append(count)
+        return answer
+
+    win = SearchWindow(backend, now=clock, confirm_clear=confirm)
+    win.show_and_focus()
+    return win, asked
+
+
+def test_clear_all_keeps_pinned_items(qapp: QApplication, backend: FakeBackend, clock: Clock) -> None:
+    backend.pin(1)
+    win, asked = clear_window(backend, clock)
+    win.clear_button.click()
+    assert asked == [3]
+    assert [row.item_id for row in win.model.rows] == [1]
+    assert not win.clear_button.isEnabled() and not win.clear_action.isEnabled()
+    win.hide()
+
+
+def test_clear_all_only_clears_the_chip_shown(
+    qapp: QApplication, backend: FakeBackend, clock: Clock
+) -> None:
+    win, asked = clear_window(backend, clock)
+    win.set_filter(Label.LINK)
+    win.clear_action.trigger()
+    assert asked == [1]
+    assert sorted(backend.store) == [1, 3, 4]
+    win.hide()
+
+
+def test_clear_all_does_nothing_when_answered_no(
+    qapp: QApplication, backend: FakeBackend, clock: Clock
+) -> None:
+    win, asked = clear_window(backend, clock, answer=False)
+    win.clear_button.click()
+    assert asked == [4] and len(backend.store) == 4
+    win.hide()
+
+
+def test_clear_question_gives_only_a_count() -> None:
+    assert clear_question(1) == "Delete this item? Pinned items are kept. This cannot be undone."
+    assert "3 items" in clear_question(3)
+

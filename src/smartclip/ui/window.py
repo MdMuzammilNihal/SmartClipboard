@@ -8,10 +8,21 @@ Windows (ui/theme.py).
 
 Layout, top to bottom: the search box (focused whenever the window opens)
 with the pause and "more" buttons, a "Capture paused" banner while paused,
-a row of filter chips (All, then each badge present in the history), then
-the cards. Each card shows the type badge, the state badge ("Secret" /
-"Review?"), the source app, the age, a pin mark, a "..." menu button, and
-up to three lines of the item's text.
+a row of filter chips (All, then each badge present in the history) with a
+"Clear all" button, then the cards. Each card shows the type badge, the
+state badge ("Secret" / "Review?"), the source app, the age, a pin mark, a
+"..." menu button, and up to three lines of the item's text.
+
+Owner's decisions (2026-11-19, second round):
+- The card under the mouse, and the selected card, show buttons next to
+  "...": reveal/hide, mark normal and delete on Secret and Review? cards;
+  pin/unpin, mark secret and delete on normal cards.
+- The "..." menu has tick boxes to hide the search bar and the filter
+  chips, remembered after a restart (ui/prefs.py). While the search bar is
+  hidden, typing shows it again until the window hides; clicking a badge
+  shows the chips again in the same way.
+- "Clear all" deletes the cards shown right now (the current chip and
+  search), except pinned ones, after one confirmation that gives the count.
 
 Mouse and keys:
 - Click a card (or press Enter) to paste it. Up and Down move the
@@ -19,6 +30,7 @@ Mouse and keys:
 - Click a card's type or state badge, or a chip, to filter by it.
 - Click a masked text to reveal it for 10 seconds (Ctrl+R does the same for
   the selected card); click it again to mask it.
+- The buttons on the card under the mouse do the same as their menu items.
 - The "..." button, a right-click, or Shift+F10 opens the card menu: paste,
   copy only, reveal, pin, mark normal, mark secret, delete. Ctrl+P pins or
   unpins, Shift+Del deletes (after a confirmation).
@@ -39,6 +51,7 @@ SECURITY REVIEW (owner):
 - After a paste or copy the window hides, so a revealed secret is not left
   on screen.
 - Deleting asks for confirmation; the question never quotes the item.
+  Clear all asks once, giving only the number of items.
 - The window hides as soon as another app takes the focus (as Win+V does).
   Its own dialogs and menus do not count as leaving.
 - Tooltips are fixed hints; they never show an item's text.
@@ -51,7 +64,7 @@ SECURITY REVIEW (owner):
 """
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Protocol
 
@@ -107,6 +120,7 @@ from smartclip.labels import Label, SecretState
 from smartclip.storage import StoredItem
 from smartclip.ui import theme as themes
 from smartclip.ui.paste import Paster
+from smartclip.ui.prefs import MemoryPrefs, PrefsStore
 from smartclip.ui.view_model import (
     LABEL_BADGES,
     STATE_BADGES,
@@ -125,6 +139,7 @@ ROW_ROLE = Qt.ItemDataRole.UserRole + 1
 _AGE_REFRESH_TICKS = 30
 MAX_BODY_LINES = 3
 DELETE_QUESTION = "Delete this item? This cannot be undone."
+CLEAR_TOOLTIP = "Delete the items shown (pinned items are kept)"
 EMPTY_TEXT = "Nothing here yet. Copy some text and it will show up here."
 NO_MATCH_TEXT = "No matching items."
 REVEAL_HINT = "Click to reveal"
@@ -136,11 +151,15 @@ _OUTER_X, _OUTER_Y, _PAD, _GAP, _BADGE_PAD_X = 8, 4, 10, 6, 7
 # Icon glyphs from the Windows icon fonts (Windows 11, then Windows 10).
 _ICON_FONTS = ["Segoe Fluent Icons", "Segoe MDL2 Assets"]
 _GLYPH_PAUSE, _GLYPH_PLAY, _GLYPH_MORE, _GLYPH_PIN = "", "", "", ""
+_GLYPH_VIEW, _GLYPH_HIDE, _GLYPH_DELETE = "", "", ""
+_GLYPH_LOCK, _GLYPH_UNLOCK = "", ""
 
 # Regions of a card that react to a click.
 REGION_CARD, REGION_LABEL, REGION_STATE, REGION_MENU, REGION_TEXT = (
     "card", "label", "state", "menu", "text",
 )
+# The buttons shown on the card under the mouse or selected.
+REGION_REVEAL, REGION_PIN, REGION_MARK, REGION_DELETE = "reveal", "pin", "mark", "delete"
 
 
 class WindowBackend(Protocol):
@@ -171,9 +190,49 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def clear_question(count: int) -> str:
+    """The Clear all question. Gives the number of items only, never their text."""
+    items = "this item" if count == 1 else f"these {count} items"
+    return f"Delete {items}? Pinned items are kept. This cannot be undone."
+
+
+def question_box(parent: QWidget, title: str, text: str) -> QMessageBox:
+    """A Yes/No question kept above the always-on-top window.
+
+    The main window uses WindowStaysOnTopHint, so an ordinary dialog can end
+    up behind it (seen on the owner's machine). The question gets the same
+    hint and is raised when shown.
+    """
+    box = QMessageBox(
+        QMessageBox.Icon.Question,
+        title,
+        text,
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        parent,
+    )
+    # Modality first: setting it afterwards resets the window flags (measured).
+    box.setWindowModality(Qt.WindowModality.ApplicationModal)
+    box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+    return box
+
+
+def delete_question_box(parent: QWidget) -> QMessageBox:
+    return question_box(parent, "Delete item", DELETE_QUESTION)
+
+
+def _ask(box: QMessageBox) -> bool:
+    # Raise once the dialog is on screen, in case Windows placed it lower.
+    QTimer.singleShot(0, box.raise_)
+    QTimer.singleShot(0, box.activateWindow)
+    return box.exec() == QMessageBox.StandardButton.Yes
+
+
 def _ask_delete(parent: QWidget) -> bool:
-    answer = QMessageBox.question(parent, "Delete item", DELETE_QUESTION)
-    return answer == QMessageBox.StandardButton.Yes
+    return _ask(delete_question_box(parent))
+
+
+def _ask_clear(parent: QWidget, count: int) -> bool:
+    return _ask(question_box(parent, "Clear all", clear_question(count)))
 
 
 def place_near(pointer: QPoint, size: QSize, area: QRect, offset: int = 8) -> QPoint:
@@ -227,18 +286,34 @@ class CardRects:
     label: QRect | None  # None when the state badge already says it all
     state: QRect | None
     menu: QRect
-    pin: QRect | None
+    pin: QRect | None  # the pin mark on a pinned card without buttons
     top_text: QRect  # source app and age, between the badges and the icons
     body: QRect
     text: QRect | None  # the clickable masked or revealed text
+    buttons: tuple[tuple[str, QRect], ...] = ()  # (region, rect), left to right
+
+
+def card_buttons(row: Row) -> list[str]:
+    """The buttons an active card shows, left to right, before the "..." button.
+
+    Secret and Review? cards: reveal/hide, mark normal, delete. Normal cards:
+    pin/unpin, mark secret, delete (sensitive items cannot be pinned).
+    """
+    if row.state is not SecretState.NORMAL:
+        return [REGION_REVEAL, REGION_MARK, REGION_DELETE]
+    return [REGION_PIN, REGION_MARK, REGION_DELETE]
 
 
 def _badge_width(badge: Badge, metrics: QFontMetrics) -> int:
     return metrics.horizontalAdvance(badge.text) + 2 * _BADGE_PAD_X
 
 
-def card_rects(rect: QRect, row: Row, metrics: QFontMetrics) -> CardRects:
-    """Lay out one card inside the list cell `rect`."""
+def card_rects(rect: QRect, row: Row, metrics: QFontMetrics, active: bool = False) -> CardRects:
+    """Lay out one card inside the list cell `rect`.
+
+    `active` (the card under the mouse, or the selected one) adds the card
+    buttons; the source app and age then get less room.
+    """
     card = rect.adjusted(_OUTER_X, _OUTER_Y, -_OUTER_X, -_OUTER_Y)
     inner = card.adjusted(_PAD, _PAD, -_PAD, -_PAD)
     badge_height = metrics.height() + 4
@@ -255,8 +330,14 @@ def card_rects(rect: QRect, row: Row, metrics: QFontMetrics) -> CardRects:
         right_of_badges = state.right()
     menu = QRect(inner.right() - badge_height + 1, inner.top(), badge_height, badge_height)
     pin = None
+    buttons: list[tuple[str, QRect]] = []
     right_edge = menu.left() - 2
-    if row.pinned:
+    if active:
+        for region in reversed(card_buttons(row)):
+            button = QRect(right_edge - badge_height, inner.top(), badge_height, badge_height)
+            buttons.insert(0, (region, button))
+            right_edge = button.left() - 2
+    elif row.pinned:
         pin = QRect(menu.left() - badge_height - 2, inner.top(), badge_height, badge_height)
         right_edge = pin.left() - 2
     top_text = QRect(
@@ -274,7 +355,7 @@ def card_rects(rect: QRect, row: Row, metrics: QFontMetrics) -> CardRects:
         text = QRect(body.left(), body.top(), min(hint_width, body.width()), metrics.lineSpacing())
     elif row.revealed:
         text = body
-    return CardRects(card, label, state, menu, pin, top_text, body, text)
+    return CardRects(card, label, state, menu, pin, top_text, body, text, tuple(buttons))
 
 
 def show_label_badge(row: Row) -> bool:
@@ -286,6 +367,9 @@ def region_at(rects: CardRects, point: QPoint) -> str:
     """Which part of a card a click at `point` landed on."""
     if rects.menu.contains(point):
         return REGION_MENU
+    for region, button in rects.buttons:
+        if button.contains(point):
+            return region
     if rects.label is not None and rects.label.contains(point):
         return REGION_LABEL
     if rects.state is not None and rects.state.contains(point):
@@ -372,9 +456,9 @@ class CardDelegate(QStyledItemDelegate):
             return
         t = self.theme
         metrics = option.fontMetrics
-        rects = card_rects(option.rect, row, metrics)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        rects = card_rects(option.rect, row, metrics, active=selected or hovered)
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
@@ -401,6 +485,10 @@ class CardDelegate(QStyledItemDelegate):
         if rects.pin is not None:
             painter.setPen(QColor(t.accent))
             painter.drawText(rects.pin, center, _GLYPH_PIN)
+        for region, button in rects.buttons:
+            glyph, on = button_glyph(row, region)
+            painter.setPen(QColor(t.accent if on else t.muted))
+            painter.drawText(button, center, glyph)
         painter.setPen(QColor(t.muted))
         painter.drawText(rects.menu, center, _GLYPH_MORE)
         painter.setFont(option.font)
@@ -443,7 +531,9 @@ class CardDelegate(QStyledItemDelegate):
             row = index.data(ROW_ROLE)
             if isinstance(row, Row):
                 point = event.position().toPoint()  # type: ignore[attr-defined]
-                region = region_at(card_rects(option.rect, row, option.fontMetrics), point)
+                # A click lands on the card under the mouse, which shows its buttons.
+                rects = card_rects(option.rect, row, option.fontMetrics, active=True)
+                region = region_at(rects, point)
                 self.region_clicked.emit(
                     index.row(), region, self._view.viewport().mapToGlobal(point)
                 )
@@ -458,7 +548,8 @@ class CardDelegate(QStyledItemDelegate):
         if not isinstance(row, Row):
             return False
         point = event.pos()  # type: ignore[attr-defined]
-        tip = card_tooltip(row, region_at(card_rects(option.rect, row, option.fontMetrics), point))
+        rects = card_rects(option.rect, row, option.fontMetrics, active=True)
+        tip = card_tooltip(row, region_at(rects, point))
         if tip:
             QToolTip.showText(event.globalPos(), tip, view)  # type: ignore[attr-defined]
         else:
@@ -476,7 +567,27 @@ def card_tooltip(row: Row, region: str) -> str:
         return "More actions"
     if region == REGION_TEXT:
         return HIDE_HINT if row.revealed else "Click to reveal for 10 seconds"
+    if region == REGION_REVEAL:
+        return "Hide" if row.revealed else "Reveal for 10 seconds"
+    if region == REGION_PIN:
+        return "Unpin" if row.pinned else "Pin (kept until unpinned)"
+    if region == REGION_MARK:
+        return "Mark secret" if row.state is SecretState.NORMAL else "Mark normal"
+    if region == REGION_DELETE:
+        return "Delete"
     return ""
+
+
+def button_glyph(row: Row, region: str) -> tuple[str, bool]:
+    """The icon for one card button, and whether it is drawn as "on" (accent)."""
+    if region == REGION_REVEAL:
+        return (_GLYPH_HIDE, True) if row.revealed else (_GLYPH_VIEW, False)
+    if region == REGION_PIN:
+        return _GLYPH_PIN, row.pinned
+    if region == REGION_MARK:
+        # The lock marks secret; the open lock marks a Secret/Review? item normal.
+        return (_GLYPH_LOCK, False) if row.state is SecretState.NORMAL else (_GLYPH_UNLOCK, False)
+    return _GLYPH_DELETE, False
 
 
 def present_filters(items: list[StoredItem]) -> list[Filter]:
@@ -501,9 +612,17 @@ class SearchWindow(QWidget):
         paster: Paster | None = None,
         current_theme: Callable[[], themes.Theme] = themes.current_theme,
         switches: list[Switch] | None = None,
+        prefs: PrefsStore | None = None,
+        confirm_clear: Callable[[QWidget, int], bool] = _ask_clear,
     ) -> None:
         super().__init__()
         self._backend = backend
+        self._prefs_store = prefs or MemoryPrefs()
+        self.prefs = self._prefs_store.load()
+        self._confirm_clear = confirm_clear
+        # Shown for this opening only although hidden in prefs (typing, badge click).
+        self._search_shown_for_now = False
+        self._filters_shown_for_now = False
         self._now = now
         self.reveals = reveals or RevealState()
         self._confirm_delete = confirm_delete
@@ -522,6 +641,8 @@ class SearchWindow(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
         )
         self.resize(WINDOW_SIZE)
+        # Takes the keys while the search bar is hidden.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self.search = QLineEdit()
         self.search.setObjectName("search")
@@ -542,6 +663,18 @@ class SearchWindow(QWidget):
         self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         more_menu = QMenu(self)
         self.pause_action = more_menu.addAction("Pause capture", self.toggle_pause)
+        self.clear_action = more_menu.addAction("Clear all", self.clear_all)
+        more_menu.addSeparator()
+        self.show_search_action = more_menu.addAction("Show search bar")
+        self.show_search_action.setCheckable(True)
+        self.show_search_action.triggered.connect(
+            lambda on: self.set_layout(show_search=on)
+        )
+        self.show_filters_action = more_menu.addAction("Show filters")
+        self.show_filters_action.setCheckable(True)
+        self.show_filters_action.triggered.connect(
+            lambda on: self.set_layout(show_filters=on)
+        )
         self.switch_actions = []
         if switches:
             more_menu.addSeparator()
@@ -576,6 +709,17 @@ class SearchWindow(QWidget):
         chips_scroll.viewport().installEventFilter(self)
         self.chips_scroll = chips_scroll
         chips_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.clear_button = QPushButton("Clear all")
+        self.clear_button.setProperty("chip", True)
+        self.clear_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.clear_button.setToolTip(CLEAR_TOOLTIP)
+        self.clear_button.clicked.connect(self.clear_all)
+        self.filters_row = QWidget()
+        filters_layout = QHBoxLayout(self.filters_row)
+        filters_layout.setContentsMargins(0, 0, 0, 0)
+        filters_layout.setSpacing(6)
+        filters_layout.addWidget(chips_scroll, 1)
+        filters_layout.addWidget(self.clear_button)
 
         self.model = CardsModel(self)
         self.list = QListView()
@@ -606,6 +750,7 @@ class SearchWindow(QWidget):
         top = QHBoxLayout()
         top.setSpacing(4)
         top.addWidget(self.search, 1)
+        top.addStretch(0)  # keeps the buttons at the right while the search bar is hidden
         top.addWidget(self.pause_button)
         top.addWidget(self.more_button)
         inner = QVBoxLayout(panel)
@@ -613,7 +758,7 @@ class SearchWindow(QWidget):
         inner.setSpacing(6)
         inner.addLayout(top)
         inner.addWidget(self.pause_label)
-        inner.addWidget(chips_scroll)
+        inner.addWidget(self.filters_row)
         inner.addWidget(self.list, 1)
         inner.addWidget(self.empty_label, 1)
         inner.addWidget(self.status_label)
@@ -636,6 +781,7 @@ class SearchWindow(QWidget):
         self._timer.timeout.connect(self._tick)
 
         self.apply_theme()
+        self.apply_layout()
         self.refresh()
 
     # --- Showing and hiding ---
@@ -649,13 +795,58 @@ class SearchWindow(QWidget):
         self.search.blockSignals(False)
         self._filter = None
         self.reveals.hide_all()
+        self._search_shown_for_now = self._filters_shown_for_now = False
         self.apply_theme()
+        self.apply_layout()
         self.refresh()
         self.move_near_pointer()
         self.show()
         self.raise_()
         self.activateWindow()
+        self.focus_keys()
+
+    def focus_keys(self) -> None:
+        """Keys go to the search box, or to the window while the box is hidden."""
+        if self.search.isVisibleTo(self):
+            self.search.setFocus()
+        else:
+            self.setFocus()
+
+    # --- Search bar and filters shown or hidden (ui/prefs.py) ---
+
+    def apply_layout(self) -> None:
+        """Show or hide the search bar and the filter row as chosen."""
+        self.search.setVisible(self.prefs.show_search or self._search_shown_for_now)
+        self.filters_row.setVisible(self.prefs.show_filters or self._filters_shown_for_now)
+        self.show_search_action.setChecked(self.prefs.show_search)
+        self.show_filters_action.setChecked(self.prefs.show_filters)
+
+    def set_layout(self, show_search: bool | None = None, show_filters: bool | None = None) -> None:
+        """Change and remember what shows above the cards (the "..." tick boxes)."""
+        changes: dict[str, bool] = {}
+        if show_search is not None:
+            changes["show_search"] = show_search
+            self._search_shown_for_now = False
+            if not show_search:
+                self.search.clear()  # no hidden search left filtering the cards
+        if show_filters is not None:
+            changes["show_filters"] = show_filters
+            self._filters_shown_for_now = False
+            if not show_filters:
+                self._filter = None  # no hidden filter left on
+        self.prefs = replace(self.prefs, **changes)
+        if not self._prefs_store.save(self.prefs):
+            self.status_label.setText("Could not save this choice; it lasts until restart")
+        self.apply_layout()
+        self.refresh()
+        self.focus_keys()
+
+    def show_search_for_now(self, text: str) -> None:
+        """Bring back a hidden search bar for this opening, starting with `text`."""
+        self._search_shown_for_now = True
+        self.apply_layout()
         self.search.setFocus()
+        self.search.insert(text)
 
     def apply_theme(self) -> None:
         """Use the light or dark colours that match Windows right now."""
@@ -682,6 +873,9 @@ class SearchWindow(QWidget):
         # Nothing stays revealed behind a hidden window.
         self._timer.stop()
         self.reveals.hide_all()
+        if self._search_shown_for_now or self._filters_shown_for_now:
+            self._search_shown_for_now = self._filters_shown_for_now = False
+            self.apply_layout()
         self.refresh()
         super().hideEvent(event)
 
@@ -710,6 +904,10 @@ class SearchWindow(QWidget):
 
     def set_filter(self, active: Filter | None) -> None:
         self._filter = active
+        if active is not None and not self.prefs.show_filters:
+            # Show the chips for now, so the filter can be seen and cleared.
+            self._filters_shown_for_now = True
+            self.apply_layout()
         self.refresh()
 
     def refresh(self) -> None:
@@ -736,6 +934,13 @@ class SearchWindow(QWidget):
         self.pause_button.setToolTip("Resume capture" if paused else "Pause capture")
         self.pause_action.setText("Resume capture" if paused else "Pause capture")
         self.status_label.setVisible(bool(self.status_label.text()))
+        clearable = bool(self.clearable_rows())
+        self.clear_button.setEnabled(clearable)
+        self.clear_action.setEnabled(clearable)
+
+    def clearable_rows(self) -> list[Row]:
+        """What Clear all would delete: the cards shown now, except pinned ones."""
+        return [row for row in self.model.rows if not row.pinned]
 
     def _update_chips(self, items: list[StoredItem]) -> None:
         wanted = present_filters(items)
@@ -802,6 +1007,17 @@ class SearchWindow(QWidget):
             self.toggle_reveal(row)
         elif region == REGION_MENU:
             self.open_menu(row, global_pos or QCursor.pos())
+        elif region == REGION_REVEAL:
+            self.toggle_reveal(row)
+        elif region == REGION_PIN:
+            self.toggle_pin(row)
+        elif region == REGION_MARK:
+            if row.state is SecretState.NORMAL:
+                self.mark_secret(row)
+            else:
+                self.mark_normal(row)
+        elif region == REGION_DELETE:
+            self.delete(row)
         else:
             self.choose_selected()
 
@@ -912,6 +1128,16 @@ class SearchWindow(QWidget):
         self.reveals.hide(row.item_id)
         self.refresh()
 
+    def clear_all(self) -> None:
+        """Delete every card shown (current chip and search), keeping pinned ones."""
+        rows = self.clearable_rows()
+        if not rows or not self._confirm_clear(self, len(rows)):
+            return
+        for row in rows:
+            self._backend.delete(row.item_id)
+            self.reveals.hide(row.item_id)
+        self.refresh()
+
     def delete_selected(self) -> None:
         row = self.selected_row()
         if row is not None:
@@ -934,11 +1160,33 @@ class SearchWindow(QWidget):
 
     # --- Keys ---
 
+    def _navigate(self, key: int) -> bool:
+        """Up, Down and Enter act on the cards. True if `key` was one of them."""
+        if key == Qt.Key.Key_Down:
+            self._move_selection(1)
+        elif key == Qt.Key.Key_Up:
+            self._move_selection(-1)
+        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.choose_selected()
+        else:
+            return False
+        return True
+
     def keyPressEvent(self, event: QEvent) -> None:  # noqa: N802 (Qt name)
+        key = event.key()  # type: ignore[attr-defined]
         # Esc pressed anywhere else in the window.
-        if event.key() == Qt.Key.Key_Escape:  # type: ignore[attr-defined]
+        if key == Qt.Key.Key_Escape:
             self.hide()
             return
+        if not self.search.isVisibleTo(self):
+            if self._navigate(key):
+                return
+            text = event.text()  # type: ignore[attr-defined]
+            held = event.modifiers()  # type: ignore[attr-defined]
+            control = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier
+            if text and text.isprintable() and not held & control:
+                self.show_search_for_now(text)
+                return
         super().keyPressEvent(event)  # type: ignore[arg-type]
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802 (Qt name)
@@ -948,14 +1196,7 @@ class SearchWindow(QWidget):
             return True
         if watched is self.search and event.type() == QEvent.Type.KeyPress:
             key = event.key()  # type: ignore[attr-defined]
-            if key == Qt.Key.Key_Down:
-                self._move_selection(1)
-                return True
-            if key == Qt.Key.Key_Up:
-                self._move_selection(-1)
-                return True
-            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                self.choose_selected()
+            if self._navigate(key):
                 return True
             if key == Qt.Key.Key_Escape:
                 if self.search.text():
