@@ -14,6 +14,7 @@ APP_DIR_NAME = "SmartClipboard"
 DATABASE_FILE_NAME = "items.db"
 LOG_DIR_NAME = "logs"
 DEDUPE_KEY_FILE_NAME = "dedupe.key"
+LABELED_LOG_FILE_NAME = "labeled.db"
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,11 @@ CAPTURED_SECRET_CLEAR_AFTER = timedelta(seconds=30)
 REMOVE_SECRETS_FROM_WIN_HISTORY = True
 WIN_HISTORY_REMOVE_AFTER = CAPTURED_SECRET_CLEAR_AFTER + timedelta(seconds=2)
 
+# The private labeled-data log for Phase 2 (task 20; see datalog.py). Off by
+# default (owner's decision). Set to True to opt in; the settings screen will
+# switch it later. Secret and unsure items are only written redacted.
+LABELED_LOG_ENABLED = False
+
 # The shortest time between two VACUUM runs. A starting value, not measured:
 # VACUUM rewrites the whole file, so it should not run after every cleanup.
 VACUUM_INTERVAL = timedelta(days=1)
@@ -123,3 +129,8 @@ def dedupe_key_path() -> Path:
 def log_dir() -> Path:
     """Return the folder for log files."""
     return app_data_dir() / LOG_DIR_NAME
+
+
+def labeled_log_path() -> Path:
+    """Return the path of the opt-in labeled-data log (task 20)."""
+    return app_data_dir() / LABELED_LOG_FILE_NAME

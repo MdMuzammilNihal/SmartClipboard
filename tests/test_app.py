@@ -16,6 +16,7 @@ import pytest
 
 from smartclip import logsafe
 from smartclip.app import AppBackend, build_payload, key_error_message
+from smartclip.datalog import LabeledLog, RecordEvent
 from smartclip.dedupe import KEY_LENGTH, DedupeKey
 from smartclip.gate import PauseSwitch
 from smartclip.history import History
@@ -466,3 +467,72 @@ def test_without_a_remover_nothing_is_scheduled(backend: AppBackend, clock: Cloc
     backend.handle_event(event(FAKE_TOKEN, 5))
     clock.now = NOW + timedelta(minutes=1)
     assert backend.run_due_history_removals() == 0
+
+
+# --- Labeled-data log (task 20) ---
+
+
+@pytest.fixture
+def labeled_log(tmp_path: Path) -> Iterator[LabeledLog]:
+    with LabeledLog(tmp_path / "labeled.db") as opened:
+        yield opened
+
+
+@pytest.fixture
+def logged_backend(
+    history: History, copier: FakeCopier, sequence: list[int], clock: Clock, labeled_log: LabeledLog
+) -> AppBackend:
+    return AppBackend(
+        history, copier, PauseSwitch(), lambda: sequence[0], now=clock, labeled_log=labeled_log
+    )
+
+
+def test_new_capture_is_logged_once_and_merges_are_not(
+    logged_backend: AppBackend, labeled_log: LabeledLog
+) -> None:
+    item_id = logged_backend.handle_event(event(FAKE_NOTE, 1))
+    logged_backend.handle_event(event(FAKE_NOTE, 2, at=NOW + timedelta(minutes=1)))
+    [record] = labeled_log.load_all()[0]
+    assert (record.event, record.item_id, record.content) == (RecordEvent.CAPTURED, item_id, FAKE_NOTE)
+    assert record.owner_confirmed is False
+
+
+def test_secret_capture_is_logged_redacted(
+    logged_backend: AppBackend, labeled_log: LabeledLog
+) -> None:
+    logged_backend.handle_event(event(FAKE_TOKEN))
+    [record] = labeled_log.load_all()[0]
+    assert record.redacted and record.content != FAKE_TOKEN
+    assert record.content.startswith("ghp_") and len(record.content) == len(FAKE_TOKEN)
+    assert record.secret_state is SecretState.SECRET
+
+
+def test_marking_writes_confirmed_records(
+    logged_backend: AppBackend, labeled_log: LabeledLog, clock: Clock
+) -> None:
+    unsure_id = logged_backend.handle_event(event(FAKE_UNSURE))
+    clock.now = NOW + timedelta(minutes=5)
+    logged_backend.mark_normal(unsure_id)
+    logged_backend.mark_normal(unsure_id)  # no change, no record
+    logged_backend.mark_secret(unsure_id)
+    captured, normal, secret = labeled_log.load_all()[0]
+    assert captured.redacted and captured.content != FAKE_UNSURE
+    assert (normal.event, normal.owner_confirmed, normal.at) == (
+        RecordEvent.MARKED_NORMAL, True, NOW + timedelta(minutes=5)
+    )
+    assert normal.content == FAKE_UNSURE and not normal.redacted  # owner's decision
+    assert secret.event is RecordEvent.MARKED_SECRET
+    assert secret.redacted and secret.content != FAKE_UNSURE
+
+
+def test_deleting_an_item_keeps_its_records(
+    logged_backend: AppBackend, labeled_log: LabeledLog
+) -> None:
+    item_id = logged_backend.handle_event(event(FAKE_NOTE))
+    logged_backend.delete(item_id)
+    assert len(labeled_log.load_all()[0]) == 1
+
+
+def test_no_log_is_written_when_turned_off(backend: AppBackend, tmp_path: Path) -> None:
+    backend.handle_event(event(FAKE_NOTE))
+    assert not (tmp_path / "labeled.db").exists()

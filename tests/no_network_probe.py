@@ -9,7 +9,7 @@ every app module and runs the app's flows with fake data:
 - the real DPAPI-protected dedupe key and encrypted SQLite store in that folder,
 - AppBackend: capture of fake text (a note, a duplicate, a fake token),
   copy-back requests to a fake target, mark secret, mark normal, pin,
-  delete, cleanup,
+  delete, cleanup, with the opt-in labeled-data log turned on,
 - the search window in an off-screen Qt app, showing and refreshing rows,
 - Win+V removal through the real HistoryCleaner and the real asyncio path
   of WinRtHistoryApi, with the history listing replaced so the owner's
@@ -106,6 +106,7 @@ def run_flows(folder: Path) -> None:
 
     from smartclip import logsafe
     from smartclip.app import AppBackend
+    from smartclip.datalog import LabeledLog
     from smartclip.dedupe import DedupeKey
     from smartclip.gate import Gate, PauseSwitch
     from smartclip.history import History
@@ -133,7 +134,7 @@ def run_flows(folder: Path) -> None:
     api.text_entries()  # the real asyncio.run path, with an empty listing
 
     qt_app = QApplication.instance() or QApplication([])
-    with Store(folder / "items.db") as store:
+    with Store(folder / "items.db") as store, LabeledLog(folder / "labeled.db") as labeled:
         key = DedupeKey.load_or_create(folder / "dedupe.key")
         history = History(store, key)
         history.load()
@@ -142,6 +143,7 @@ def run_flows(folder: Path) -> None:
         backend = AppBackend(
             history, FakeCopier(), PauseSwitch(), sequence_number=lambda: 1,
             win_history=cleaner,
+            labeled_log=labeled,
         )
         note_id = backend.handle_event(ClipboardEvent(FAKE_NOTE, 1, now, "fakeeditor.exe"))
         backend.handle_event(ClipboardEvent(FAKE_NOTE, 2, now, "fakeeditor.exe"))
@@ -161,6 +163,7 @@ def run_flows(folder: Path) -> None:
         cleaner.shutdown()
         backend.delete(token_id)
         backend.cleanup()
+        labeled.load_all()
         window.refresh()
         qt_app.processEvents()
         window.hide()

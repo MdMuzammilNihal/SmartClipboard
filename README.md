@@ -26,6 +26,7 @@ A local, privacy-focused smart clipboard for Windows. It watches what you copy, 
 | Wiring (`app.py`: listener to labeling to storage, hotkeys, cleanup timer) | Written; the capture path is tested with fake events on a temporary database. Not yet run on real copies. Only one copy runs at a time. No tray icon or settings screen yet |
 | Removing confirmed secrets from Win+V history | Written; tested with a fake history, and an opt-in test that puts fake text in the real Win+V history and removes it passes on the owner's Windows 11 machine. Hand-checked by the owner with fake text (2026-11-19): a captured secret leaves Win+V after the paste window, a Review? item marked secret leaves at once, and Mark normal cancels. Effect on cloud-synced devices not verified |
 | Clearing secrets copied in other apps (30 seconds after capture, only if nothing was copied since; not for "Review?" items) | Written; tested with a fake clipboard and real window messages. Hand-tested by the owner on Windows 11 with fake text (2026-11-19): a captured secret is cleared, a newer copy is kept, "Review?" items are left alone, Ctrl+Alt+S starts the clear, and Mark normal cancels it. The opt-in automated real-clipboard test has not been run. Win+V history is not touched |
+| Opt-in labeled-data log for Phase 2 (off by default) | Written; tested with fake data on a temporary file (redaction, encryption, damaged records, no content in logs, the app writing records on capture and marking). Not yet turned on or used on real copies |
 | Safe copy-back for secrets | Written; tested with a fake clipboard and real window messages. Opt-in tests that write fake text to the real clipboard pass on the owner's Windows 11 machine (opt-out formats set, own write not captured, cleared after the delay, a newer copy left alone). Not yet checked that Win+V history and cloud sync really leave the item out. Nothing calls it yet (the window is not built) |
 
 This table is updated as work lands.
@@ -197,6 +198,18 @@ Expected: no connections at all, except possibly a short-lived `127.0.0.1` pair 
 | Secrets and unsure items | Deleted 2 hours after the first copy; copying again does not extend this | Yes |
 | Pinned normal items | Kept until unpinned | |
 | Secrets and unsure items | Cannot be pinned | |
+
+## Labeled-data log (opt-in, off by default)
+
+Phase 2 needs a private test set of real copies with the right labels. If you turn this log on, the app keeps one for you. It is off unless you set `LABELED_LOG_ENABLED = True` in `src/smartclip/config.py` (the settings screen will switch it later).
+
+- **Where:** `%LOCALAPPDATA%\SmartClipboard\labeled.db`, outside the repository, encrypted with DPAPI like the history. Only each record's number is readable in the file.
+- **What is written:** one record for each new item captured (a re-copy that merges into an existing item is not written again), and one each time you mark an item secret or normal. A record holds the text, the label, the secret state, whether you confirmed it, the source app's name, the item number, and the time. Never a window title.
+- **Secrets are redacted.** Secret and "Review?" items are written only in redacted form: same length, spaces kept, known format prefixes such as `ghp_`, `sk-`, `AKIA` and private-key header lines kept, and every other letter and digit replaced with a random one of the same kind (upper case, lower case, digit). In a one-word item, such as a lone password or token, every symbol is replaced with a random symbol too. In text with several words (JSON, a command, an env var line) punctuation is kept, because there it carries the structure. The real text is never written.
+- **Mark normal writes the real text.** Marking an item normal tells the app it is not a secret, so that record holds the text as it is. If you mark a real secret normal by mistake, its text stays in the log until you delete the file.
+- **Records are kept until you delete the file.** Deleting an item in the window, or the item expiring, leaves its records in place. That is the purpose of a test set, and the reason the log is opt-in. To stop and erase it, set the option back to `False` and delete `labeled.db`.
+- **What redaction still shows:** the length, and where the upper case letters, lower case letters, digits, and symbols are. In text with several words it also shows the exact spaces and punctuation, so a symbols-only word inside such text is written as it is. Field names inside a redacted JSON blob or env var line are randomised along with the rest.
+- The log is private and never published. Phase 2 will use it on this machine only.
 
 ## Default hotkeys
 

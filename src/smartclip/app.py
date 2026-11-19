@@ -52,6 +52,11 @@ SECURITY REVIEW (owner):
   still runs if something newer was copied meanwhile, and if the item was
   deleted from this app. Marking the item normal cancels it; unsure items
   are never removed. Pending removals run at once when the app quits.
+- The opt-in labeled-data log (task 20, datalog.py) is written only when
+  config.LABELED_LOG_ENABLED is True: one record per new capture (not for a
+  merged re-copy) and one per mark secret or mark normal that changed the
+  item. Secret and unsure items are written redacted; a Mark normal record
+  holds the real text (owner's decision 2026-11-19).
 - Logs record item ids, content types, lengths, and counts only.
 - Known limit: the pause state is only visible in the window, since there
   is no tray icon yet.
@@ -66,6 +71,7 @@ from pathlib import Path
 from typing import Protocol
 
 from smartclip import classify, config, logsafe, overrides, retention, secret_rules
+from smartclip.datalog import LabeledLog, RecordEvent
 from smartclip.dedupe import DedupeKey, DedupeKeyError
 from smartclip.gate import Gate, PauseSwitch
 from smartclip.history import History
@@ -143,6 +149,7 @@ class AppBackend:
         now: Callable[[], datetime] = _utc_now,
         on_quit: Callable[[], None] = lambda: None,
         win_history: HistoryRemover | None = None,
+        labeled_log: LabeledLog | None = None,
     ) -> None:
         self._history = history
         self._copier = copier
@@ -152,6 +159,7 @@ class AppBackend:
         self._on_quit = on_quit
         self.last_capture = overrides.LastCapture()
         self._win_history = win_history
+        self._labeled_log = labeled_log
         # Item id -> (keyed hash, when to remove it from Win+V history).
         self._history_due: dict[int, tuple[str, datetime]] = {}
 
@@ -163,6 +171,8 @@ class AppBackend:
         result = self._history.capture(payload, event.captured_at)
         self.last_capture.record(result.item_id, event.sequence_number)
         stored = self._history.get(result.item_id)
+        if stored is not None and not result.merged:
+            self._write_labeled(RecordEvent.CAPTURED, stored, event.captured_at)
         # The stored state counts: a re-copy merged into a secret stays secret.
         if stored is not None and stored.payload.secret_state is SecretState.SECRET:
             self._copier.request_capture_clear(event.sequence_number)
@@ -255,7 +265,11 @@ class AppBackend:
         item = self._history.get(item_id)
         if item is None:
             return False
-        changed = self._history.update(item_id, overrides.mark_normal(item.payload))
+        updated = overrides.mark_normal(item.payload)
+        changed = self._history.update(item_id, updated)
+        marked = self._history.get(item_id)
+        if changed and marked is not None and updated != item.payload:
+            self._write_labeled(RecordEvent.MARKED_NORMAL, marked, self._now())
         if changed and self._on_clipboard_now(item_id) is not None:
             self._copier.request_capture_clear(None)
         if changed and self._history_due.pop(item_id, None) is not None:
@@ -267,17 +281,25 @@ class AppBackend:
         item = self._history.get(item_id)
         if item is None:
             return False
-        changed = self._history.update(item_id, overrides.mark_secret(item.payload, self._now()))
+        updated = overrides.mark_secret(item.payload, self._now())
+        changed = self._history.update(item_id, updated)
         sequence = self._on_clipboard_now(item_id)
         if changed and sequence is not None:
             self._copier.request_capture_clear(sequence)
         marked = self._history.get(item_id)
         if changed and marked is not None:
+            if updated != item.payload:  # only a real change is a new label
+                self._write_labeled(RecordEvent.MARKED_SECRET, marked, self._now())
             # Still on the clipboard: wait for the paste window. Older: now.
             delay = config.WIN_HISTORY_REMOVE_AFTER if sequence is not None else timedelta(0)
             self._schedule_history_removal(marked, delay)
         logsafe.log_event(_log, "item_marked_secret", item_id=item_id, changed=changed)
         return changed
+
+    def _write_labeled(self, event: RecordEvent, item: StoredItem, at: datetime) -> None:
+        """Add a record to the opt-in labeled log, if it is turned on."""
+        if self._labeled_log is not None:
+            self._labeled_log.record(event, item.id, item.payload, at)
 
     def _schedule_history_removal(self, item: StoredItem, delay: timedelta) -> None:
         """Plan the removal of a secret's Win+V entries after `delay`."""
@@ -369,6 +391,7 @@ def main() -> int:
         return 1
 
     cleaner = HistoryCleaner(key.digest) if config.REMOVE_SECRETS_FROM_WIN_HISTORY else None
+    labeled_log = LabeledLog(config.labeled_log_path()) if config.LABELED_LOG_ENABLED else None
     backend = AppBackend(
         history,
         listener,
@@ -376,6 +399,7 @@ def main() -> int:
         sequence_number=win32clipboard.GetClipboardSequenceNumber,
         on_quit=qt_app.quit,
         win_history=cleaner,
+        labeled_log=labeled_log,
     )
     backend.cleanup()
     window = SearchWindow(backend)
@@ -445,6 +469,8 @@ def main() -> int:
         backend.run_due_history_removals(everything=True)
         if cleaner is not None:
             cleaner.shutdown()
+        if labeled_log is not None:
+            labeled_log.close()
         store.close()
         logsafe.log_event(_log, "app_stopped")
         del instance_lock
