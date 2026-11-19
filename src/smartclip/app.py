@@ -43,7 +43,15 @@ SECURITY REVIEW (owner):
   listener is asked to empty the clipboard 30 seconds later if nothing was
   copied since. Unsure items are not cleared. Marking the item on the
   clipboard normal cancels the clear. Deleting the item does not: the secret
-  is still on the clipboard. Win+V history is not touched.
+  is still on the clipboard.
+- Confirmed secrets are also removed from Win+V history (owner's decision
+  2026-11-19, option C; winhistory.py). Same triggers as above, plus
+  marking an older item secret. The item on the clipboard now waits
+  `WIN_HISTORY_REMOVE_AFTER` (32 seconds), because deleting its history
+  entry also empties the clipboard; an older item is removed at once. It
+  still runs if something newer was copied meanwhile, and if the item was
+  deleted from this app. Marking the item normal cancels it; unsure items
+  are never removed. Pending removals run at once when the app quits.
 - Logs record item ids, content types, lengths, and counts only.
 - Known limit: the pause state is only visible in the window, since there
   is no tray icon yet.
@@ -53,7 +61,7 @@ import queue
 import sys
 from collections.abc import Callable
 from concurrent.futures import Future
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol
 
@@ -76,6 +84,12 @@ class CopyBackTarget(Protocol):
     def request_copy_back(self, text: str, sensitive: bool) -> "Future[bool] | None": ...
 
     def request_capture_clear(self, sequence: int | None) -> bool: ...
+
+
+class HistoryRemover(Protocol):
+    """The part of winhistory.HistoryCleaner the backend uses."""
+
+    def submit(self, digest: str) -> object: ...
 
 
 def _utc_now() -> datetime:
@@ -128,6 +142,7 @@ class AppBackend:
         sequence_number: Callable[[], int],
         now: Callable[[], datetime] = _utc_now,
         on_quit: Callable[[], None] = lambda: None,
+        win_history: HistoryRemover | None = None,
     ) -> None:
         self._history = history
         self._copier = copier
@@ -136,6 +151,9 @@ class AppBackend:
         self._now = now
         self._on_quit = on_quit
         self.last_capture = overrides.LastCapture()
+        self._win_history = win_history
+        # Item id -> (keyed hash, when to remove it from Win+V history).
+        self._history_due: dict[int, tuple[str, datetime]] = {}
 
     # --- Capture and retention ---
 
@@ -148,6 +166,7 @@ class AppBackend:
         # The stored state counts: a re-copy merged into a secret stays secret.
         if stored is not None and stored.payload.secret_state is SecretState.SECRET:
             self._copier.request_capture_clear(event.sequence_number)
+            self._schedule_history_removal(stored, config.WIN_HISTORY_REMOVE_AFTER)
         logsafe.log_event(
             _log,
             "item_captured",
@@ -178,6 +197,22 @@ class AppBackend:
             self.last_capture.forget(item_id)
         self._history.vacuum_if_due(now)
         return deleted
+
+    def run_due_history_removals(self, everything: bool = False) -> int:
+        """Hand due Win+V removals to the worker. everything=True runs all (at exit)."""
+        if self._win_history is None:
+            return 0
+        now = self._now()
+        due = [
+            item_id
+            for item_id, (_digest, when) in self._history_due.items()
+            if everything or now >= when
+        ]
+        for item_id in due:
+            digest, _when = self._history_due.pop(item_id)
+            self._win_history.submit(digest)
+            logsafe.log_event(_log, "win_history_removal_started", item_id=item_id)
+        return len(due)
 
     def mark_last_secret(self) -> bool:
         """The Ctrl+Alt+S action: mark the item on the clipboard now as secret."""
@@ -223,6 +258,8 @@ class AppBackend:
         changed = self._history.update(item_id, overrides.mark_normal(item.payload))
         if changed and self._on_clipboard_now(item_id) is not None:
             self._copier.request_capture_clear(None)
+        if changed and self._history_due.pop(item_id, None) is not None:
+            logsafe.log_event(_log, "win_history_removal_cancelled", item_id=item_id)
         logsafe.log_event(_log, "item_marked_normal", item_id=item_id, changed=changed)
         return changed
 
@@ -234,8 +271,26 @@ class AppBackend:
         sequence = self._on_clipboard_now(item_id)
         if changed and sequence is not None:
             self._copier.request_capture_clear(sequence)
+        marked = self._history.get(item_id)
+        if changed and marked is not None:
+            # Still on the clipboard: wait for the paste window. Older: now.
+            delay = config.WIN_HISTORY_REMOVE_AFTER if sequence is not None else timedelta(0)
+            self._schedule_history_removal(marked, delay)
         logsafe.log_event(_log, "item_marked_secret", item_id=item_id, changed=changed)
         return changed
+
+    def _schedule_history_removal(self, item: StoredItem, delay: timedelta) -> None:
+        """Plan the removal of a secret's Win+V entries after `delay`."""
+        if self._win_history is None:
+            return
+        digest = item.payload.dedupe_key
+        if digest is None:
+            # Only rows saved before payload version 2 lack it.
+            logsafe.log_event(_log, "win_history_no_key", item_id=item.id)
+            return
+        self._history_due[item.id] = (digest, self._now() + delay)
+        if delay <= timedelta(0):
+            self.run_due_history_removals()
 
     def _on_clipboard_now(self, item_id: int) -> int | None:
         """The clipboard sequence number if this item is what the clipboard holds now."""
@@ -270,6 +325,7 @@ def main() -> int:
     from smartclip.storage import Store
     from smartclip.ui import capture_guard
     from smartclip.ui.window import SearchWindow
+    from smartclip.winhistory import HistoryCleaner
 
     logsafe.setup_logging(config.log_dir())
     logsafe.install_crash_handlers()
@@ -312,12 +368,14 @@ def main() -> int:
         store.close()
         return 1
 
+    cleaner = HistoryCleaner(key.digest) if config.REMOVE_SECRETS_FROM_WIN_HISTORY else None
     backend = AppBackend(
         history,
         listener,
         pause,
         sequence_number=win32clipboard.GetClipboardSequenceNumber,
         on_quit=qt_app.quit,
+        win_history=cleaner,
     )
     backend.cleanup()
     window = SearchWindow(backend)
@@ -358,6 +416,7 @@ def main() -> int:
     def poll_events() -> None:
         if backend.drain(events) and window.isVisible():
             window.refresh()
+        backend.run_due_history_removals()
 
     def run_cleanup() -> None:
         if backend.cleanup() and window.isVisible():
@@ -382,6 +441,10 @@ def main() -> int:
         # Stopping the listener also clears a pending secret copy-back.
         listener.stop()
         backend.drain(events)
+        # Pending Win+V removals run now, so a secret does not outlive the app there.
+        backend.run_due_history_removals(everything=True)
+        if cleaner is not None:
+            cleaner.shutdown()
         store.close()
         logsafe.log_event(_log, "app_stopped")
         del instance_lock

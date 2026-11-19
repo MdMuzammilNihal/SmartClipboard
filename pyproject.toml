@@ -15,6 +15,15 @@ license-files = ["LICENSE"]
 # calls, so every addition needs a reason and a check of what it does.
 dependencies = [
     "pywin32==312",
+    # Windows Runtime bindings, used only to remove confirmed secrets from
+    # Win+V clipboard history (winhistory.py; owner's approval 2026-11-19).
+    # No network use. Storage.Streams is required by DataTransfer; it is
+    # pinned here so every install gets the same version.
+    "winrt-runtime==4.2.0",
+    "winrt-Windows.ApplicationModel.DataTransfer==4!10.0.28000.2957",
+    "winrt-Windows.Foundation==4!10.0.28000.2957",
+    "winrt-Windows.Foundation.Collections==4!10.0.28000.2957",
+    "winrt-Windows.Storage.Streams==4!10.0.28000.2957",
 ]
 
 [project.optional-dependencies]

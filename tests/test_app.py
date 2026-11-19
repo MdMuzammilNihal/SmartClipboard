@@ -362,3 +362,107 @@ def test_marking_an_older_item_normal_does_not_cancel(
     sequence[0] = 6
     backend.mark_normal(old_id)
     assert copier.clear_requests == [5]
+
+
+# --- Removing secrets from Win+V history (option C) ---
+
+
+class FakeRemover:
+    def __init__(self) -> None:
+        self.digests: list[str] = []
+
+    def submit(self, digest: str) -> None:
+        self.digests.append(digest)
+
+
+@pytest.fixture
+def remover() -> FakeRemover:
+    return FakeRemover()
+
+
+@pytest.fixture
+def c_backend(
+    history: History, copier: FakeCopier, sequence: list[int], clock: Clock, remover: FakeRemover
+) -> AppBackend:
+    return AppBackend(
+        history, copier, PauseSwitch(), lambda: sequence[0], now=clock, win_history=remover
+    )
+
+
+def test_captured_secret_is_removed_after_the_paste_window(
+    c_backend: AppBackend, remover: FakeRemover, clock: Clock
+) -> None:
+    c_backend.handle_event(event(FAKE_TOKEN, 7))
+    assert c_backend.run_due_history_removals() == 0
+    clock.now = NOW + timedelta(seconds=31)
+    assert c_backend.run_due_history_removals() == 0  # the clipboard clear goes first
+    clock.now = NOW + timedelta(seconds=32)
+    assert c_backend.run_due_history_removals() == 1
+    assert remover.digests == [KEY.digest(FAKE_TOKEN)]
+    assert c_backend.run_due_history_removals() == 0  # only once
+
+
+@pytest.mark.parametrize("text", [FAKE_NOTE, FAKE_UNSURE], ids=["normal", "unsure"])
+def test_normal_and_unsure_are_never_removed(
+    c_backend: AppBackend, remover: FakeRemover, clock: Clock, text: str
+) -> None:
+    c_backend.handle_event(event(text, 7))
+    clock.now = NOW + timedelta(minutes=5)
+    c_backend.run_due_history_removals()
+    assert remover.digests == []
+
+
+def test_review_item_marked_secret_while_on_clipboard_waits(
+    c_backend: AppBackend, remover: FakeRemover, clock: Clock, sequence: list[int]
+) -> None:
+    item_id = c_backend.handle_event(event(FAKE_UNSURE, 5))
+    sequence[0] = 5
+    c_backend.mark_secret(item_id)
+    assert remover.digests == []
+    clock.now = NOW + timedelta(seconds=32)
+    c_backend.run_due_history_removals()
+    assert remover.digests == [KEY.digest(FAKE_UNSURE)]
+
+
+def test_older_item_marked_secret_is_removed_at_once(
+    c_backend: AppBackend, remover: FakeRemover, sequence: list[int]
+) -> None:
+    old_id = c_backend.handle_event(event(FAKE_UNSURE, 5))
+    c_backend.handle_event(event(FAKE_NOTE, 6))
+    sequence[0] = 6
+    c_backend.mark_secret(old_id)
+    assert remover.digests == [KEY.digest(FAKE_UNSURE)]
+
+
+def test_mark_normal_cancels_the_removal(
+    c_backend: AppBackend, remover: FakeRemover, clock: Clock, sequence: list[int]
+) -> None:
+    item_id = c_backend.handle_event(event(FAKE_TOKEN, 5))
+    sequence[0] = 5
+    c_backend.mark_normal(item_id)
+    clock.now = NOW + timedelta(minutes=5)
+    assert c_backend.run_due_history_removals() == 0
+    assert remover.digests == []
+
+
+def test_removal_still_runs_after_newer_copy_and_delete(
+    c_backend: AppBackend, remover: FakeRemover, clock: Clock, sequence: list[int]
+) -> None:
+    item_id = c_backend.handle_event(event(FAKE_TOKEN, 5))
+    c_backend.handle_event(event(FAKE_NOTE, 6))
+    c_backend.delete(item_id)
+    clock.now = NOW + timedelta(seconds=32)
+    c_backend.run_due_history_removals()
+    assert remover.digests == [KEY.digest(FAKE_TOKEN)]
+
+
+def test_quit_runs_every_pending_removal(c_backend: AppBackend, remover: FakeRemover) -> None:
+    c_backend.handle_event(event(FAKE_TOKEN, 5))
+    assert c_backend.run_due_history_removals(everything=True) == 1
+    assert remover.digests == [KEY.digest(FAKE_TOKEN)]
+
+
+def test_without_a_remover_nothing_is_scheduled(backend: AppBackend, clock: Clock) -> None:
+    backend.handle_event(event(FAKE_TOKEN, 5))
+    clock.now = NOW + timedelta(minutes=1)
+    assert backend.run_due_history_removals() == 0

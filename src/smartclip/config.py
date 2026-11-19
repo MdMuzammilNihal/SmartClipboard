@@ -63,6 +63,15 @@ COPYBACK_CLEAR_AFTER = timedelta(seconds=30)
 # option B). Only clearly secret items, and only if nothing was copied since.
 CAPTURED_SECRET_CLEAR_AFTER = timedelta(seconds=30)
 
+# Remove confirmed secrets from Windows clipboard history (Win+V) as well
+# (owner's decision 2026-11-19, option C; see winhistory.py). An item still
+# on the clipboard is removed after this delay: deleting its Win+V entry
+# also empties the clipboard, so it waits for the paste window plus a small
+# margin, letting the 30-second clipboard clear run first. An older item
+# marked secret is removed at once.
+REMOVE_SECRETS_FROM_WIN_HISTORY = True
+WIN_HISTORY_REMOVE_AFTER = CAPTURED_SECRET_CLEAR_AFTER + timedelta(seconds=2)
+
 # The shortest time between two VACUUM runs. A starting value, not measured:
 # VACUUM rewrites the whole file, so it should not run after every cleanup.
 VACUUM_INTERVAL = timedelta(days=1)
