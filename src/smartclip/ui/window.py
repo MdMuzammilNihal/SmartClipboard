@@ -116,29 +116,42 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from smartclip import config
 from smartclip.labels import Label, SecretState
 from smartclip.storage import StoredItem
 from smartclip.ui import theme as themes
+from smartclip.ui.notice import Notice
 from smartclip.ui.paste import Paster
 from smartclip.ui.prefs import MemoryPrefs, PrefsStore
+from smartclip.ui.settings_dialog import SettingsPanel
+from smartclip.ui.toast import Toast
 from smartclip.ui.view_model import (
     LABEL_BADGES,
+    QUICK_PASTE_COUNT,
     STATE_BADGES,
     Badge,
     Filter,
+    Header,
     RevealState,
     Row,
+    arrange,
     build_rows,
     filter_name,
+    hint_text,
 )
 
 WINDOW_SIZE = QSize(380, 520)
 # The role under which the model hands the whole Row to the delegate.
 ROW_ROLE = Qt.ItemDataRole.UserRole + 1
+# The number shown on the first nine cards (Alt+1 to Alt+9 paste them).
+NUMBER_ROLE = Qt.ItemDataRole.UserRole + 2
+HEADER_HEIGHT = 30  # a day header: room above, then one line of small text
 # Ages are redrawn this often (in seconds) while the window is open.
 _AGE_REFRESH_TICKS = 30
 MAX_BODY_LINES = 3
-DELETE_QUESTION = "Delete this item? This cannot be undone."
+UNDO_TEXT = "Undo"
+PAUSED_TEXT = "Paused: nothing is being saved"
+COPIED_TEXT = "Copied. Press Ctrl+V to paste."
 CLEAR_TOOLTIP = "Delete the items shown (pinned items are kept)"
 EMPTY_TEXT = "Nothing here yet. Copy some text and it will show up here."
 NO_MATCH_TEXT = "No matching items."
@@ -170,6 +183,7 @@ class WindowBackend(Protocol):
     def pin(self, item_id: int) -> bool: ...
     def unpin(self, item_id: int) -> bool: ...
     def delete(self, item_id: int) -> bool: ...
+    def restore(self, items: list[StoredItem]) -> int: ...
     def mark_normal(self, item_id: int) -> bool: ...
     def mark_secret(self, item_id: int) -> bool: ...
     def is_paused(self) -> bool: ...
@@ -188,6 +202,17 @@ class Switch(Protocol):
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def clear_text(count: int, pinned_kept: int) -> str:
+    """The toast after Clear all: how many went, and how many pinned stayed."""
+    text = f"Cleared {count} item" + ("" if count == 1 else "s")
+    return f"{text}, {pinned_kept} pinned kept" if pinned_kept else text
+
+
+def partial_restore_text(restored: int, asked: int) -> str:
+    """Undo could not bring everything back: some had expired or were copied again."""
+    return f"Restored {restored} of {asked} (the rest expired or were copied again)"
 
 
 def clear_question(count: int) -> str:
@@ -216,19 +241,11 @@ def question_box(parent: QWidget, title: str, text: str) -> QMessageBox:
     return box
 
 
-def delete_question_box(parent: QWidget) -> QMessageBox:
-    return question_box(parent, "Delete item", DELETE_QUESTION)
-
-
 def _ask(box: QMessageBox) -> bool:
     # Raise once the dialog is on screen, in case Windows placed it lower.
     QTimer.singleShot(0, box.raise_)
     QTimer.singleShot(0, box.activateWindow)
     return box.exec() == QMessageBox.StandardButton.Yes
-
-
-def _ask_delete(parent: QWidget) -> bool:
-    return _ask(delete_question_box(parent))
 
 
 def _ask_clear(parent: QWidget, count: int) -> bool:
@@ -389,38 +406,78 @@ def card_height(row: Row, font: QFont, width: int) -> int:
 
 
 class CardsModel(QAbstractListModel):
-    """Holds the current rows for the list view."""
+    """Holds what the list view shows: cards (Row) and day headers (Header).
+
+    `rows` is only the cards, in the order shown. Qt positions (`index(n)`,
+    `row_at(n)`) count the headers too; use `position_of` to turn an item id
+    into one. A header cannot be selected, so the arrow keys and Enter never
+    land on it.
+    """
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
+        self._entries: list[Row | Header] = []
         self._rows: list[Row] = []
+        self._numbers: dict[int, int] = {}
 
     @property
     def rows(self) -> list[Row]:
         return self._rows
 
-    def set_rows(self, rows: list[Row]) -> None:
+    @property
+    def entries(self) -> list[Row | Header]:
+        return self._entries
+
+    def set_rows(self, entries: list[Row | Header]) -> None:
         self.beginResetModel()
-        self._rows = rows
+        self._entries = entries
+        self._rows = [entry for entry in entries if isinstance(entry, Row)]
+        # Quick-paste numbers go to the first nine cards; headers are not counted.
+        self._numbers = {
+            position: number
+            for number, position in enumerate(self.card_positions()[:QUICK_PASTE_COUNT], start=1)
+        }
         self.endResetModel()
 
     def row_at(self, index: int) -> Row | None:
-        return self._rows[index] if 0 <= index < len(self._rows) else None
+        """The card at a Qt position, or None for a header or a bad position."""
+        entry = self._entries[index] if 0 <= index < len(self._entries) else None
+        return entry if isinstance(entry, Row) else None
+
+    def position_of(self, item_id: int) -> int | None:
+        """The Qt position of the card for `item_id`, or None."""
+        for position, entry in enumerate(self._entries):
+            if isinstance(entry, Row) and entry.item_id == item_id:
+                return position
+        return None
+
+    def card_positions(self) -> list[int]:
+        """Qt positions of the cards only (the places the selection may go)."""
+        return [i for i, entry in enumerate(self._entries) if isinstance(entry, Row)]
 
     def rowCount(self, parent: QModelIndex | QPersistentModelIndex = QModelIndex()) -> int:
-        return 0 if parent.isValid() else len(self._rows)
+        return 0 if parent.isValid() else len(self._entries)
+
+    def flags(self, index: QModelIndex | QPersistentModelIndex) -> Qt.ItemFlag:  # noqa: N802
+        entry = self._entries[index.row()] if 0 <= index.row() < len(self._entries) else None
+        if isinstance(entry, Header):
+            return Qt.ItemFlag.NoItemFlags  # drawn, but cannot be selected or made current
+        return super().flags(index)
 
     def data(
         self, index: QModelIndex | QPersistentModelIndex, role: int = Qt.ItemDataRole.DisplayRole
     ) -> object:
-        row = self.row_at(index.row())
-        if row is None:
+        entry = self._entries[index.row()] if 0 <= index.row() < len(self._entries) else None
+        if entry is None:
             return None
         if role == ROW_ROLE:
-            return row
+            return entry
+        if role == NUMBER_ROLE:
+            return self._numbers.get(index.row())
         if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.AccessibleTextRole):
-            # The bullet mask for masked rows; the text itself never leaves here.
-            return row.preview
+            # Headers show their fixed word. For cards: the bullet mask for
+            # masked rows; the text itself never leaves here.
+            return entry.text if isinstance(entry, Header) else entry.preview
         return None
 
 
@@ -441,6 +498,8 @@ class CardDelegate(QStyledItemDelegate):
     ) -> QSize:
         row = index.data(ROW_ROLE)
         width = self._view.viewport().width()
+        if isinstance(row, Header):
+            return QSize(width, HEADER_HEIGHT)
         if not isinstance(row, Row):
             return QSize(width, 0)
         return QSize(width, card_height(row, option.font, width))
@@ -452,6 +511,9 @@ class CardDelegate(QStyledItemDelegate):
         index: QModelIndex | QPersistentModelIndex,
     ) -> None:
         row = index.data(ROW_ROLE)
+        if isinstance(row, Header):
+            self._paint_header(painter, option, row)
+            return
         if not isinstance(row, Row):
             return
         t = self.theme
@@ -475,11 +537,32 @@ class CardDelegate(QStyledItemDelegate):
 
         painter.setPen(QColor(t.muted))
         age_width = metrics.horizontalAdvance(row.age) + 4
-        source_rect = rects.top_text.adjusted(0, 0, -age_width, 0)
+        number = index.data(NUMBER_ROLE)
+        # The quick-paste number is drawn as a small key-cap left of the age;
+        # the buttons take that place while the card is active.
+        numbered = number is not None and not rects.buttons
+        keycap_size = rects.top_text.height() - 4
+        number_width = keycap_size + 8 if numbered else 0
+        source_rect = rects.top_text.adjusted(0, 0, -(age_width + number_width), 0)
         source = metrics.elidedText(row.source_app, Qt.TextElideMode.ElideRight, source_rect.width())
         align = Qt.AlignmentFlag.AlignVCenter
         painter.drawText(source_rect, align | Qt.AlignmentFlag.AlignLeft, source)
         painter.drawText(rects.top_text, align | Qt.AlignmentFlag.AlignRight, row.age)
+        if numbered:
+            keycap = QRect(
+                rects.top_text.right() - age_width - keycap_size - 4,
+                rects.top_text.top() + 2,
+                keycap_size,
+                keycap_size,
+            )
+            painter.setOpacity(0.7)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(t.border), 1))
+            painter.drawRoundedRect(keycap, 4, 4)
+            painter.setPen(QColor(t.muted))
+            painter.drawText(keycap, Qt.AlignmentFlag.AlignCenter, str(number))
+            painter.setOpacity(1.0)
+            painter.setPen(QColor(t.muted))
 
         painter.setFont(self.icon_font)
         center = Qt.AlignmentFlag.AlignCenter
@@ -509,6 +592,19 @@ class CardDelegate(QStyledItemDelegate):
                 line_rect = QRect(rects.body.left(), y, rects.body.width(), metrics.lineSpacing())
                 painter.drawText(line_rect, top_left, line)
                 y += metrics.lineSpacing()
+        painter.restore()
+
+    def _paint_header(self, painter: QPainter, option: QStyleOptionViewItem, header: Header) -> None:
+        """A small muted capitals label, like the dashboard's "MENU" (UI plan item 2)."""
+        painter.save()
+        font = QFont(option.font)
+        font.setPixelSize(11)
+        font.setWeight(QFont.Weight.DemiBold)
+        font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 110)
+        painter.setFont(font)
+        painter.setPen(QColor(self.theme.muted))
+        rect = option.rect.adjusted(6, 8, 0, 0)  # room above, aligned with the card text
+        painter.drawText(rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, header.text)
         painter.restore()
 
     def _badge(self, painter: QPainter, rect: QRect, badge: Badge) -> None:
@@ -609,27 +705,39 @@ class SearchWindow(QWidget):
         backend: WindowBackend,
         now: Callable[[], datetime] = _utc_now,
         reveals: RevealState | None = None,
-        confirm_delete: Callable[[QWidget], bool] = _ask_delete,
         active_window: Callable[[], QWidget | None] = QApplication.activeWindow,
         paster: Paster | None = None,
         current_theme: Callable[[], themes.Theme] = themes.current_theme,
         switches: list[Switch] | None = None,
         prefs: PrefsStore | None = None,
         confirm_clear: Callable[[QWidget, int], bool] = _ask_clear,
+        settings_panel_factory: Callable[[QWidget], SettingsPanel] | None = None,
+        show_hints: bool = True,
+        undo_ms: int = 5000,
+        pause_keys: str = config.HOTKEY_PAUSE,
     ) -> None:
         super().__init__()
         self._backend = backend
         self._prefs_store = prefs or MemoryPrefs()
         self.prefs = self._prefs_store.load()
         self._confirm_clear = confirm_clear
+        self._pause_keys = pause_keys
+        self._notice: Notice | None = None
+        self._show_hints = show_hints
+        # Built with this window as its parent, so it uses the same style sheet.
+        self.settings_panel = settings_panel_factory(self) if settings_panel_factory else None
+        if self.settings_panel is not None:
+            # The panel hides itself when another app takes the focus; so do we.
+            self.settings_panel.focus_left.connect(self.hide_if_focus_left)
         # Shown for this opening only although hidden in prefs (typing, badge click).
         self._search_shown_for_now = False
         self._filters_shown_for_now = False
         self._now = now
         self.reveals = reveals or RevealState()
-        self._confirm_delete = confirm_delete
         self._active_window = active_window
         self._paster = paster
+        if paster is not None:
+            paster.on_copy_only = self.show_copy_notice
         self._current_theme = current_theme
         self._filter: Filter | None = None
         self._chip_filters: list[Filter] = []
@@ -677,6 +785,8 @@ class SearchWindow(QWidget):
         self.show_filters_action.triggered.connect(
             lambda on: self.set_layout(show_filters=on)
         )
+        self.settings_action = more_menu.addAction("Settings...", self.open_settings)
+        self.settings_action.setEnabled(self.settings_panel is not None)
         self.switch_actions = []
         if switches:
             more_menu.addSeparator()
@@ -692,8 +802,18 @@ class SearchWindow(QWidget):
         self.quit_action = more_menu.addAction("Quit Smart Clipboard", self._backend.quit)
         self.more_button.setMenu(more_menu)
 
-        self.pause_label = QLabel("Capture paused: new copies are not saved")
-        self.pause_label.setObjectName("banner")
+        # Shown while paused: what it means, and a way back (UI plan item 5).
+        self.pause_banner = QFrame()
+        self.pause_banner.setObjectName("banner")
+        self.pause_label = QLabel(PAUSED_TEXT)
+        self.resume_button = QPushButton("Resume")
+        self.resume_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.resume_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.resume_button.clicked.connect(self.toggle_pause)
+        banner_row = QHBoxLayout(self.pause_banner)
+        banner_row.setContentsMargins(10, 4, 6, 4)
+        banner_row.addWidget(self.pause_label, 1)
+        banner_row.addWidget(self.resume_button)
 
         self.chips_bar = QWidget()
         self.chips_bar.setObjectName("chips")
@@ -727,6 +847,7 @@ class SearchWindow(QWidget):
         self.list = QListView()
         self.list.setModel(self.model)
         self.delegate = CardDelegate(self.list)
+        self.list.selectionModel().currentChanged.connect(lambda *_args: self.update_hint())
         self.list.setItemDelegate(self.delegate)
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -746,6 +867,16 @@ class SearchWindow(QWidget):
         self.status_label = QLabel()
         self.status_label.setObjectName("status")
         self.status_label.setWordWrap(True)
+        # The keyboard hints (UI plan item 3), switched off in the settings panel.
+        self.hint_label = QLabel()
+        self.hint_label.setObjectName("hint")
+        self.hint_label.setWordWrap(True)
+        self.hint_label.setVisible(show_hints)
+        # Floats over the bottom of the window (not in the layout).
+        self._undo_items: list[StoredItem] = []
+        self.toast = Toast(self, duration_ms=undo_ms)
+        self.toast.action_clicked.connect(self.undo_delete)
+        self.toast.finished.connect(self._drop_undo_items)
 
         panel = QFrame()
         panel.setObjectName("panel")
@@ -759,11 +890,12 @@ class SearchWindow(QWidget):
         inner.setContentsMargins(10, 10, 10, 8)
         inner.setSpacing(6)
         inner.addLayout(top)
-        inner.addWidget(self.pause_label)
+        inner.addWidget(self.pause_banner)
         inner.addWidget(self.filters_row)
         inner.addWidget(self.list, 1)
         inner.addWidget(self.empty_label, 1)
         inner.addWidget(self.status_label)
+        inner.addWidget(self.hint_label)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(panel)
@@ -777,6 +909,12 @@ class SearchWindow(QWidget):
             ("Menu", self.open_menu_for_selected),
         ):
             self.shortcuts[keys] = QShortcut(QKeySequence(keys), self, activated=action)
+        # Alt, not bare digits, so typing numbers in the search box still works.
+        for number in range(1, QUICK_PASTE_COUNT + 1):
+            keys = f"Alt+{number}"
+            self.shortcuts[keys] = QShortcut(
+                QKeySequence(keys), self, activated=lambda n=number: self.quick_paste(n)
+            )
 
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
@@ -871,7 +1009,16 @@ class SearchWindow(QWidget):
             _round_corners(self)
         super().showEvent(event)
 
+    def open_settings(self) -> None:
+        """Show the settings panel beside this window."""
+        if self.settings_panel is not None:
+            self.settings_panel.open_beside(self)
+
     def hideEvent(self, event: QEvent) -> None:  # noqa: N802 (Qt name)
+        # A pending Undo ends with the window: the deletes are already final.
+        self.toast.dismiss()
+        if self.settings_panel is not None:
+            self.settings_panel.hide()
         # Nothing stays revealed behind a hidden window.
         self._timer.stop()
         self.reveals.hide_all()
@@ -890,6 +1037,8 @@ class SearchWindow(QWidget):
 
     def hide_if_focus_left(self) -> None:
         """Hide when no window of this app has the focus any more."""
+        if self.settings_panel is not None and self.settings_panel.isVisible():
+            return  # the settings panel is ours; it reports when the focus leaves it
         if self.isVisible() and self._active_window() is None and QApplication.activePopupWidget() is None:
             self.hide()
 
@@ -916,26 +1065,32 @@ class SearchWindow(QWidget):
         """Rebuild the cards from the backend, keeping the selected item selected."""
         selected = self.selected_row()
         items = self._backend.items()
-        rows = build_rows(items, self.search.text(), self._filter, self.reveals, self._now())
-        self.model.set_rows(rows)
-        target = 0
+        now = self._now()
+        rows = build_rows(items, self.search.text(), self._filter, self.reveals, now)
+        entries = arrange(rows, now, bool(self.search.text().strip()))
+        self.model.set_rows(entries)
+        cards = self.model.card_positions()
+        target = cards[0] if cards else None
         if selected is not None:
-            for position, row in enumerate(rows):
-                if row.item_id == selected.item_id:
-                    target = position
-                    break
-        if rows:
+            kept = self.model.position_of(selected.item_id)
+            if kept is not None:
+                target = kept
+        if target is not None:
             self.list.setCurrentIndex(self.model.index(target))
         self.list.setVisible(bool(rows))
         self.empty_label.setVisible(not rows)
         self.empty_label.setText(EMPTY_TEXT if not items else NO_MATCH_TEXT)
         self._update_chips(items)
         paused = self._backend.is_paused()
-        self.pause_label.setVisible(paused)
+        self.pause_banner.setVisible(paused)
+        self.pause_button.setProperty("active", paused)  # drawn highlighted while paused
+        self.pause_button.style().unpolish(self.pause_button)
+        self.pause_button.style().polish(self.pause_button)
         self.pause_button.setText(_GLYPH_PLAY if paused else _GLYPH_PAUSE)
         self.pause_button.setToolTip("Resume capture" if paused else "Pause capture")
         self.pause_action.setText("Resume capture" if paused else "Pause capture")
         self.status_label.setVisible(bool(self.status_label.text()))
+        self.update_hint()
         clearable = bool(self.clearable_rows())
         self.clear_button.setEnabled(clearable)
         self.clear_action.setEnabled(clearable)
@@ -952,6 +1107,7 @@ class SearchWindow(QWidget):
             self._chip_filters = wanted
             for chip in self.chips.values():
                 self.chips_layout.removeWidget(chip)
+                chip.hide()  # gone from the screen now, deleted when Qt gets to it
                 chip.deleteLater()
             self.chips = {}
             for active in [None, *wanted]:
@@ -971,19 +1127,22 @@ class SearchWindow(QWidget):
         return self.model.row_at(index.row()) if index.isValid() else None
 
     def select_item(self, item_id: int) -> bool:
-        for position, row in enumerate(self.model.rows):
-            if row.item_id == item_id:
-                self.list.setCurrentIndex(self.model.index(position))
-                return True
-        return False
+        position = self.model.position_of(item_id)
+        if position is None:
+            return False
+        self.list.setCurrentIndex(self.model.index(position))
+        return True
 
     def _move_selection(self, step: int) -> None:
-        count = self.model.rowCount()
-        if count == 0:
+        cards = self.model.card_positions()  # headers are skipped
+        if not cards:
             return
         current = self.list.currentIndex().row()
-        position = max(0, min(count - 1, current + step))
-        self.list.setCurrentIndex(self.model.index(position))
+        if current in cards:
+            place = max(0, min(len(cards) - 1, cards.index(current) + step))
+        else:
+            place = 0 if step > 0 else len(cards) - 1
+        self.list.setCurrentIndex(self.model.index(cards[place]))
 
     def _tick(self) -> None:
         self._ticks += 1
@@ -1076,6 +1235,33 @@ class SearchWindow(QWidget):
         if row is not None:
             self.toggle_reveal(row)
 
+    def quick_paste(self, number: int) -> bool:
+        """Paste the `number`-th card shown (headers are not counted), as Enter would.
+
+        Goes through choose(), so a secret takes the same safe copy-back path.
+        False if there is no such card.
+        """
+        rows = self.model.rows
+        if not 1 <= number <= min(QUICK_PASTE_COUNT, len(rows)):
+            return False
+        self.choose(rows[number - 1], paste=True)
+        return True
+
+    def show_copy_notice(self) -> None:
+        """Tell the owner the item is on the clipboard but was not pasted for them."""
+        if self._notice is None:
+            self._notice = Notice()
+        self._notice.show_text(COPIED_TEXT, self.styleSheet(), QCursor.pos())
+
+    def set_hints_visible(self, visible: bool) -> None:
+        self._show_hints = visible
+        self.hint_label.setVisible(visible)
+
+    def update_hint(self) -> None:
+        self.hint_label.setText(
+            hint_text(self.selected_row(), self._backend.is_paused(), self._pause_keys)
+        )
+
     def choose_selected(self) -> None:
         row = self.selected_row()
         if row is not None:
@@ -1092,6 +1278,8 @@ class SearchWindow(QWidget):
             ok = copy()
         if ok:
             self.status_label.setText("")
+            if not paste or self._paster is None:
+                self.show_copy_notice()  # copied, and nothing was pasted for the owner
             self.hide()
         else:
             self.status_label.setText("Could not copy")
@@ -1124,21 +1312,67 @@ class SearchWindow(QWidget):
             self.refresh()
 
     def delete(self, row: Row) -> None:
-        if not self._confirm_delete(self):
-            return
-        self._backend.delete(row.item_id)
-        self.reveals.hide(row.item_id)
-        self.refresh()
+        """Delete one card at once; the toast offers Undo for a few seconds."""
+        self._delete_with_undo([row.item_id], "Item deleted")
 
     def clear_all(self) -> None:
         """Delete every card shown (current chip and search), keeping pinned ones."""
         rows = self.clearable_rows()
         if not rows or not self._confirm_clear(self, len(rows)):
             return
-        for row in rows:
-            self._backend.delete(row.item_id)
-            self.reveals.hide(row.item_id)
+        kept = sum(1 for row in self.model.rows if row.pinned)
+        self._delete_with_undo([row.item_id for row in rows], clear_text(len(rows), kept))
+
+    def _delete_with_undo(self, item_ids: list[int], message: str) -> None:
+        """Delete the items now and keep them in memory until Undo or the toast ends.
+
+        The delete is real at once (the database row is gone). Undo puts the
+        kept items back in their old order with their pins; the kept copy is
+        dropped when the toast ends, the window hides, or another delete
+        starts. Nothing about the items is logged or shown in the message.
+        """
+        self.toast.dismiss()  # finishes an earlier Undo offer and drops its items
+        wanted = set(item_ids)
+        kept = [item for item in self._backend.items() if item.id in wanted]
+        deleted = [item for item in kept if self._backend.delete(item.id)]
+        for item_id in item_ids:
+            self.reveals.hide(item_id)
+        self._undo_items = deleted
         self.refresh()
+        if deleted:
+            self._show_toast(message, UNDO_TEXT)
+
+    def undo_delete(self) -> None:
+        """Put back what the last delete or Clear all removed."""
+        items, self._undo_items = self._undo_items, []
+        if not items:
+            return
+        restored = self._backend.restore(items)
+        self.refresh()
+        if restored < len(items):
+            self._show_toast(partial_restore_text(restored, len(items)))
+        else:
+            self._show_toast("Restored")
+
+    def _drop_undo_items(self) -> None:
+        self._undo_items = []
+
+    def _show_toast(self, text: str, action: str | None = None) -> None:
+        self.toast.show_message(text, action)
+        self._place_toast()
+
+    def _place_toast(self) -> None:
+        """Float the toast along the bottom, above the hint bar."""
+        margin = 12
+        self.toast.setFixedWidth(max(0, self.width() - 2 * margin))
+        self.toast.adjustSize()
+        floor = self.hint_label.y() if self.hint_label.isVisible() else self.height() - 8
+        self.toast.move(margin, max(0, floor - self.toast.height() - 6))
+
+    def resizeEvent(self, event: QEvent) -> None:  # noqa: N802 (Qt name)
+        super().resizeEvent(event)  # type: ignore[arg-type]
+        if self.toast.is_active:
+            self._place_toast()
 
     def delete_selected(self) -> None:
         row = self.selected_row()
@@ -1162,6 +1396,18 @@ class SearchWindow(QWidget):
 
     # --- Keys ---
 
+    def _quick_key(self, event: QEvent) -> bool:
+        """Alt+1 to Alt+9 paste the numbered card. True if `event` was one of them."""
+        key = event.key()  # type: ignore[attr-defined]
+        held = event.modifiers()  # type: ignore[attr-defined]
+        if held != Qt.KeyboardModifier.AltModifier:
+            return False
+        number = key - Qt.Key.Key_0.value
+        if not 1 <= number <= QUICK_PASTE_COUNT:
+            return False
+        self.quick_paste(number)
+        return True
+
     def _navigate(self, key: int) -> bool:
         """Up, Down and Enter act on the cards. True if `key` was one of them."""
         if key == Qt.Key.Key_Down:
@@ -1181,7 +1427,7 @@ class SearchWindow(QWidget):
             self.hide()
             return
         if not self.search.isVisibleTo(self):
-            if self._navigate(key):
+            if self._quick_key(event) or self._navigate(key):
                 return
             text = event.text()  # type: ignore[attr-defined]
             held = event.modifiers()  # type: ignore[attr-defined]
@@ -1198,7 +1444,7 @@ class SearchWindow(QWidget):
             return True
         if watched is self.search and event.type() == QEvent.Type.KeyPress:
             key = event.key()  # type: ignore[attr-defined]
-            if self._navigate(key):
+            if self._quick_key(event) or self._navigate(key):
                 return True
             if key == Qt.Key.Key_Escape:
                 if self.search.text():

@@ -42,7 +42,7 @@ where = ["src"]
 
 # The bundled IBM Plex Serif font and its licence (SIL OFL 1.1).
 [tool.setuptools.package-data]
-"smartclip.ui" = ["fonts/*.ttf", "fonts/OFL.txt"]
+"smartclip.ui" = ["fonts/*.ttf", "fonts/OFL.txt", "icons/*.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

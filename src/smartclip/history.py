@@ -77,6 +77,19 @@ class History:
         self._deleted_since_vacuum = 0
         self._unreadable_created: dict[int, datetime] = {}
 
+    @property
+    def policy(self) -> RetentionPolicy:
+        return self._policy
+
+    def set_policy(self, policy: RetentionPolicy) -> None:
+        """Use new retention lengths from now on (the settings panel).
+
+        The normal length applies to every normal item at the next cleanup.
+        A secret's deadline is fixed when it is first saved, so a new secret
+        length only applies to secrets saved after the change.
+        """
+        self._policy = policy
+
     def load(self) -> list[int]:
         """Decrypt every row into memory. Returns the ids of unreadable rows."""
         result = self._store.load_all()
@@ -181,6 +194,31 @@ class History:
             return False
         self._delete(item_id)
         return True
+
+    def restore(self, items: list[StoredItem], now: datetime) -> list[int]:
+        """Put deleted items back (the window's Undo). Returns the new ids.
+
+        Each item keeps its first-copied time and its payload, so it lands in
+        its old place in the order and keeps its pin. The id is new, because
+        the old row is gone. Two kinds are skipped on purpose:
+        - an item whose retention deadline has passed (a secret's expiry
+          wins over Undo), and
+        - an item whose text is in the history again (copied again meanwhile),
+          so Undo never creates a duplicate.
+        """
+        restored: list[int] = []
+        for item in sorted(items, key=lambda each: each.created_at):
+            if retention.is_expired(item, now, self._policy):
+                continue
+            key = item.payload.dedupe_key or self._key.digest(item.payload.content)
+            if key in self._by_key:
+                continue
+            payload = replace(item.payload, dedupe_key=key)
+            item_id = self._store.add(payload, created_at=item.created_at)
+            self._remember(StoredItem(id=item_id, created_at=item.created_at, payload=payload))
+            restored.append(item_id)
+        logsafe.log_event(_log, "items_restored", requested=len(items), restored=len(restored))
+        return restored
 
     def _remember(self, item: StoredItem) -> None:
         self._items[item.id] = item

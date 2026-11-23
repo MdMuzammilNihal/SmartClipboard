@@ -226,6 +226,32 @@ def test_delete_forgets_last_capture(backend: AppBackend, history: History) -> N
     assert backend.delete(item_id) is False
 
 
+def test_restore_puts_deleted_items_back_with_their_pins(
+    backend: AppBackend, history: History
+) -> None:
+    first = backend.handle_event(event(FAKE_NOTE, 1))
+    backend.pin(first)
+    kept = history.get(first)
+    assert kept is not None
+    backend.delete(first)
+    assert backend.restore([kept]) == 1
+    [back] = history.items()
+    assert back.payload.content == FAKE_NOTE and back.payload.pinned is True
+    assert backend.restore([]) == 0
+
+
+def test_restore_skips_an_expired_secret(
+    backend: AppBackend, history: History, clock: Clock
+) -> None:
+    item_id = backend.handle_event(event(FAKE_TOKEN, 1))
+    kept = history.get(item_id)
+    assert kept is not None and kept.payload.secret_state is SecretState.SECRET
+    backend.delete(item_id)
+    clock.now = NOW + timedelta(hours=2, seconds=1)
+    assert backend.restore([kept]) == 0
+    assert history.items() == []
+
+
 def test_actions_on_missing_items_return_false(backend: AppBackend) -> None:
     assert backend.mark_normal(42) is False
     assert backend.mark_secret(42) is False

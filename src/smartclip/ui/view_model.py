@@ -27,12 +27,14 @@ SECURITY REVIEW (owner): what the window can show, and what search can see.
   the window. The source app is a best guess (see sourceapp.py).
 - Previews are cut to one line of PREVIEW_CHARS characters. The full text of
   a normal item is not put in tooltips or anywhere else in the window.
+- Group headers (PINNED, TODAY, ...) are fixed words and never hold item
+  text. A header's group comes from the time of the last copy only.
 - Nothing here logs, prints, or stores content.
 """
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone, tzinfo
 
 from smartclip import config, retention
 from smartclip.labels import Label, SecretState
@@ -95,6 +97,8 @@ class Row:
     revealed: bool
     pinned: bool
     can_pin: bool
+    # When the item was last copied (UTC). Decides its day group; never shown.
+    copied_at: datetime = datetime.min.replace(tzinfo=timezone.utc)
 
 
 class RevealState:
@@ -207,6 +211,7 @@ def build_rows(
                 revealed=sensitive and not masked,
                 pinned=payload.pinned,
                 can_pin=not sensitive,
+                copied_at=retention.last_copied(item),
             )
         )
     return rows
@@ -217,3 +222,91 @@ def filter_name(active: Filter) -> str:
     if isinstance(active, Label):
         return LABEL_BADGES[active].text
     return STATE_BADGES[active].text
+
+
+# --- Day groups (UI plan item 2) ---
+
+GROUP_PINNED = "PINNED"
+GROUP_TODAY = "TODAY"
+GROUP_YESTERDAY = "YESTERDAY"
+GROUP_THIS_WEEK = "THIS WEEK"
+GROUP_OLDER = "OLDER"
+GROUP_RESULTS = "RESULTS"
+_GROUP_ORDER = (GROUP_PINNED, GROUP_TODAY, GROUP_YESTERDAY, GROUP_THIS_WEEK, GROUP_OLDER)
+
+
+@dataclass(frozen=True)
+class Header:
+    """A label that starts a group of cards. Not an item: it cannot be selected."""
+
+    text: str
+
+
+def day_group(copied_at: datetime, today: date, tz: tzinfo | None = None) -> str:
+    """The day group for a copy time: compares local calendar dates, not 24-hour spans.
+
+    TODAY and YESTERDAY are the local dates; THIS WEEK is the 2 to 6 days
+    before today; OLDER is anything further back. A time in the future (a
+    clock set back) counts as today. `tz` is for tests; None means this
+    PC's local time zone.
+    """
+    days_ago = (today - copied_at.astimezone(tz).date()).days
+    if days_ago <= 0:
+        return GROUP_TODAY
+    if days_ago == 1:
+        return GROUP_YESTERDAY
+    if days_ago < 7:
+        return GROUP_THIS_WEEK
+    return GROUP_OLDER
+
+
+def arrange(
+    rows: list[Row], now: datetime, searching: bool, tz: tzinfo | None = None
+) -> list[Row | Header]:
+    """Put the rows under headers. Pinned first, then by day; flat while searching.
+
+    The rows must already be newest first. Empty groups get no header. While
+    searching there is one RESULTS header and the order is left alone.
+    """
+    if not rows:
+        return []
+    if searching:
+        return [Header(GROUP_RESULTS), *rows]
+    today = now.astimezone(tz).date()
+    groups: dict[str, list[Row]] = {name: [] for name in _GROUP_ORDER}
+    for row in rows:
+        name = GROUP_PINNED if row.pinned else day_group(row.copied_at, today, tz)
+        groups[name].append(row)
+    arranged: list[Row | Header] = []
+    for name in _GROUP_ORDER:
+        if groups[name]:
+            arranged.append(Header(name))
+            arranged.extend(groups[name])
+    return arranged
+
+
+# --- The hint bar (UI plan item 3) ---
+
+QUICK_PASTE_COUNT = 9
+
+
+def hint_text(row: Row | None, paused: bool, pause_keys: str) -> str:
+    """The keyboard hints under the list. Fixed words only, never item text.
+
+    It changes with what is selected: a secret or Review? card shows reveal,
+    a normal card shows pin. While capture is paused it says how to resume.
+    """
+    if paused:
+        return f"Paused: {pause_keys} resumes capture · Enter paste · Esc close"
+    parts = ["Enter paste"]
+    if row is not None:
+        if row.state is not SecretState.NORMAL:
+            parts.append("Ctrl+R reveal")
+        elif row.pinned:
+            parts.append("Ctrl+P unpin")
+        else:
+            parts.append("Ctrl+P pin")
+        parts.append("Shift+Del delete")
+    parts.append(f"Alt+1-{QUICK_PASTE_COUNT} quick paste")
+    parts.append("Esc close")
+    return " · ".join(parts)

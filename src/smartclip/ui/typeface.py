@@ -28,6 +28,7 @@ FONT_FILES = (
 FAMILY = "IBM Plex Serif"
 # Used when the bundled files are missing or fail to load.
 FALLBACK_FAMILIES = ["Georgia", "serif"]
+SYSTEM_FAMILY = "Segoe UI"
 # Body text in the popup: 13 px (the plan's type scale for a 380 px window).
 BODY_PIXEL_SIZE = 13
 
@@ -52,9 +53,16 @@ def load_bundled_fonts() -> list[str]:
     return families
 
 
-def app_font() -> QFont:
-    """The default font for the app's windows: Plex Serif, then the fallbacks."""
+def app_font(choice: str = "plex") -> QFont:
+    """The default font for the app's windows.
+
+    "plex" (the default): Plex Serif, then the fallbacks. "system": the
+    Windows default, Segoe UI (settings choice, UI plan item 1).
+    """
     font = QFont()
-    font.setFamilies([FAMILY, *FALLBACK_FAMILIES])
+    if choice == "system":
+        font.setFamilies([SYSTEM_FAMILY])
+    else:
+        font.setFamilies([FAMILY, *FALLBACK_FAMILIES])
     font.setPixelSize(BODY_PIXEL_SIZE)
     return font

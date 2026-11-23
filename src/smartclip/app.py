@@ -1,7 +1,8 @@
 """Wires the pieces together: listener, labeling, storage, hotkeys, window.
 
 This is the smallest wiring that lets the window run on real copies (owner's
-decision, 2026-11-18). There is no tray icon and no settings screen yet.
+decision, 2026-11-18). There is no tray icon yet. The settings panel (ui/settings_dialog.py,
+settings.py) was added on 2026-11-24.
 
 Threads:
 - The listener thread watches the clipboard and puts ClipboardEvents on a
@@ -66,6 +67,7 @@ SECURITY REVIEW (owner):
   is no tray icon yet.
 """
 
+import importlib.metadata
 import queue
 import sys
 from collections.abc import Callable
@@ -81,6 +83,7 @@ from smartclip.gate import Gate, PauseSwitch
 from smartclip.history import History
 from smartclip.labels import Label, SecretState
 from smartclip.listener import ClipboardEvent
+from smartclip.settings import JsonSettings, Settings
 from smartclip.storage import ItemPayload, StoredItem
 
 EVENT_POLL_MS = 100
@@ -104,6 +107,33 @@ class HistoryRemover(Protocol):
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def app_version() -> str:
+    """The installed version of the app, or "dev" when run from the source folder."""
+    try:
+        return importlib.metadata.version("smart-clipboard")
+    except importlib.metadata.PackageNotFoundError:
+        return "dev"
+
+
+def retention_policy(settings: Settings) -> retention.RetentionPolicy:
+    """The retention lengths the settings ask for."""
+    return retention.RetentionPolicy(
+        normal=settings.normal_retention, secret=settings.secret_retention
+    )
+
+
+def apply_settings(
+    settings: Settings,
+    history: History,
+    gate: Gate,
+    set_font: Callable[[str], None],
+) -> None:
+    """Put changed settings to work without a restart (settings panel)."""
+    history.set_policy(retention_policy(settings))
+    gate.set_excluded_apps(settings.excluded_apps)
+    set_font(settings.font)
 
 
 ALREADY_RUNNING_MESSAGE = (
@@ -265,6 +295,12 @@ class AppBackend:
         logsafe.log_event(_log, "item_deleted", item_id=item_id, deleted=deleted)
         return deleted
 
+    def restore(self, items: list[StoredItem]) -> int:
+        """Undo a delete: put the items back. Returns how many were restored."""
+        restored = self._history.restore(items, self._now())
+        logsafe.log_event(_log, "items_undeleted", requested=len(items), restored=len(restored))
+        return len(restored)
+
     def mark_normal(self, item_id: int) -> bool:
         item = self._history.get(item_id)
         if item is None:
@@ -285,7 +321,9 @@ class AppBackend:
         item = self._history.get(item_id)
         if item is None:
             return False
-        updated = overrides.mark_secret(item.payload, self._now())
+        updated = overrides.mark_secret(
+            item.payload, self._now(), self._history.policy.secret
+        )
         changed = self._history.update(item_id, updated)
         sequence = self._on_clipboard_now(item_id)
         if changed and sequence is not None:
@@ -344,7 +382,7 @@ def main() -> int:
     import win32event
     import winerror
     from PySide6.QtCore import QObject, QTimer, Signal
-    from PySide6.QtWidgets import QApplication, QMessageBox
+    from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
     from smartclip.autostart import BACKGROUND_FLAG, AutostartSwitch, ShortcutSwitch
     from smartclip.hotkeys import HotkeyError, HotkeyListener, parse_hotkey
@@ -353,6 +391,7 @@ def main() -> int:
     from smartclip.ui import capture_guard, typeface
     from smartclip.ui.paste import Paster
     from smartclip.ui.prefs import JsonPrefs
+    from smartclip.ui.settings_dialog import SettingsPanel, open_folder
     from smartclip.ui.window import SearchWindow
     from smartclip.winhistory import HistoryCleaner
 
@@ -361,7 +400,7 @@ def main() -> int:
     qt_app = QApplication(sys.argv)
     qt_app.setQuitOnLastWindowClosed(False)
     typeface.load_bundled_fonts()
-    qt_app.setFont(typeface.app_font())
+    qt_app.setFont(typeface.app_font(JsonSettings(config.settings_path()).load().font))
     if config.EXCLUDE_FROM_SCREEN_CAPTURE:
         # Installed first, so every window this app shows is covered: the
         # search window, its tooltips, menus, and dialogs, and the start-up
@@ -383,15 +422,18 @@ def main() -> int:
         QMessageBox.critical(None, "Smart Clipboard", key_error_message(config.dedupe_key_path()))
         store.close()
         return 1
-    history = History(store, key)
+    settings_store = JsonSettings(config.settings_path())
+    settings = settings_store.load()
+    history = History(store, key, policy=retention_policy(settings))
     unreadable = history.load()
     logsafe.log_event(
         _log, "history_loaded", items=len(history.items()), unreadable=len(unreadable)
     )
 
     events: "queue.Queue[ClipboardEvent]" = queue.Queue()
-    pause = PauseSwitch()
-    listener = ClipboardListener(events, gate=Gate(pause=pause))
+    pause = PauseSwitch(paused=settings.pause_on_start)
+    gate = Gate(pause=pause, excluded_apps=settings.excluded_apps)
+    listener = ClipboardListener(events, gate=gate)
     try:
         listener.start()
     except ListenerError:
@@ -411,11 +453,35 @@ def main() -> int:
         labeled_log=labeled_log,
     )
     backend.cleanup()
+
+    def set_font(choice: str) -> None:
+        qt_app.setFont(typeface.app_font(choice))
+
+    def on_settings_changed(changed: Settings) -> None:
+        apply_settings(changed, history, gate, set_font)
+        window.set_hints_visible(changed.show_hints)
+        window.refresh()
+
+    switches = [AutostartSwitch(), ShortcutSwitch()]
+
+    def make_panel(parent: QWidget) -> SettingsPanel:
+        return SettingsPanel(
+            settings_store,
+            on_settings_changed,
+            switches=switches,
+            show_data_folder=lambda: open_folder(config.app_data_dir()),
+            version=app_version(),
+            parent=parent,
+        )
+
     window = SearchWindow(
         backend,
         paster=Paster() if config.PASTE_ON_CHOOSE else None,
-        switches=[AutostartSwitch(), ShortcutSwitch()],
+        switches=switches,
         prefs=JsonPrefs(config.window_prefs_path()),
+        settings_panel_factory=make_panel,
+        show_hints=settings.show_hints,
+        pause_keys=config.HOTKEY_PAUSE,
     )
 
     class HotkeyBridge(QObject):

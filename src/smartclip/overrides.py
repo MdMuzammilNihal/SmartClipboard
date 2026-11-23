@@ -39,22 +39,30 @@ SECURITY REVIEW (owner):
 
 import threading
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from smartclip import classify, config
 from smartclip.labels import Label, SecretState
 from smartclip.storage import ItemPayload
 
 
-def mark_secret(payload: ItemPayload, now: datetime) -> ItemPayload:
-    """Return the payload marked as secret, or unchanged if it already is."""
+def mark_secret(
+    payload: ItemPayload,
+    now: datetime,
+    retention: timedelta = config.SECRET_RETENTION,
+) -> ItemPayload:
+    """Return the payload marked as secret, or unchanged if it already is.
+
+    `retention` is how long the secret is kept: the length chosen in the
+    settings panel, or the config default.
+    """
     if payload.secret_state is SecretState.SECRET:
         return payload
     return replace(
         payload,
         secret_state=SecretState.SECRET,
         pinned=False,
-        expires_at=now + config.SECRET_RETENTION,
+        expires_at=now + retention,
     )
 
 

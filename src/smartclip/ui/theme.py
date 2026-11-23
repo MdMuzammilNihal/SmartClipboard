@@ -11,6 +11,7 @@ solid colours, because Qt style sheets handle transparency less reliably.
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication
@@ -97,6 +98,10 @@ DARK = Theme(
     accent_gradient_end="#a99dff",
 )
 
+# Size of a tick box's square; the box row is taller so the square is never clipped.
+INDICATOR_SIZE = 16
+ICON_DIR = Path(__file__).with_name("icons")
+
 # Corner radii in pixels (UI plan item 11). Chips and badges are pills
 # (badges are drawn with half their height as the radius, in window.py).
 WINDOW_RADIUS = 14
@@ -114,6 +119,12 @@ def current_theme() -> Theme:
     return theme_for(QGuiApplication.styleHints().colorScheme())
 
 
+def check_icon(theme: Theme) -> str:
+    """The tick mark picture for this theme, as a style-sheet url (forward slashes)."""
+    name = "check-dark.svg" if theme.name == "dark" else "check-light.svg"
+    return (ICON_DIR / name).as_posix()
+
+
 def stylesheet(theme: Theme) -> str:
     """The Qt style sheet for the window and its menus."""
     t = theme
@@ -123,10 +134,20 @@ def stylesheet(theme: Theme) -> str:
             border-radius: {WINDOW_RADIUS}px;
         }}
         QLabel {{ color: {t.text}; background: transparent; }}
-        #muted, #status {{ color: {t.muted}; }}
+        #muted, #status, #hint {{ color: {t.muted}; }}
+        #hint {{ font-size: 11px; }}
         #banner {{
+            background: {t.banner_background}; border-radius: {BUTTON_RADIUS}px;
+        }}
+        #banner QLabel {{ color: {t.banner_text}; font-weight: 600; }}
+        #banner QPushButton {{
+            color: {t.banner_text}; background: transparent;
+            border: 1px solid {t.banner_text}; border-radius: 8px;
+            padding: 2px 10px; font-weight: 600;
+        }}
+        #banner QPushButton:hover {{ background: {t.card}; }}
+        QToolButton[active="true"] {{
             background: {t.banner_background}; color: {t.banner_text};
-            border-radius: {BUTTON_RADIUS}px; padding: 5px 8px; font-weight: 600;
         }}
         #search {{
             background: {t.input}; color: {t.text}; border: 1px solid {t.border};
@@ -147,6 +168,49 @@ def stylesheet(theme: Theme) -> str:
         QPushButton[chip="true"]:checked {{
             color: {t.accent_text}; background: {t.accent}; border-color: {t.accent};
         }}
+        #toast {{
+            background: {t.card}; border: 1px solid {t.accent};
+            border-radius: {CARD_RADIUS}px;
+        }}
+        #toast QLabel {{ color: {t.text}; }}
+        #toast QPushButton {{
+            color: {t.accent}; background: transparent; border: none;
+            font-weight: 600; padding: 4px 10px;
+        }}
+        #toast QPushButton:hover {{ background: {t.card_hover}; }}
+        #settingsBody {{ background: transparent; }}
+        QComboBox::drop-down {{ border: none; width: 22px; }}
+        QSpinBox::up-button, QSpinBox::down-button {{ width: 0px; border: none; }}
+        QSpinBox, QComboBox, QLineEdit {{
+            background: {t.input}; color: {t.text}; border: 1px solid {t.border};
+            border-radius: {BUTTON_RADIUS}px; padding: 4px 8px; min-height: 22px;
+        }}
+        QSpinBox:focus, QComboBox:focus, QLineEdit:focus {{ border-color: {t.accent}; }}
+        QComboBox QAbstractItemView {{
+            background: {t.card}; color: {t.text}; border: 1px solid {t.border};
+            selection-background-color: {t.card_selected}; selection-color: {t.text};
+        }}
+        QListWidget {{
+            background: {t.input}; color: {t.text}; border: 1px solid {t.border};
+            border-radius: {BUTTON_RADIUS}px; padding: 2px;
+        }}
+        QListWidget::item {{ padding: 3px 6px; border-radius: 6px; }}
+        QListWidget::item:selected {{ background: {t.card_selected}; color: {t.text}; }}
+        QCheckBox {{ color: {t.text}; spacing: 8px; min-height: 26px; }}
+        QCheckBox::indicator {{
+            width: {INDICATOR_SIZE}px; height: {INDICATOR_SIZE}px;
+            border: 1px solid {t.muted}; border-radius: 4px; background: {t.input};
+        }}
+        QCheckBox::indicator:hover {{ border-color: {t.accent}; }}
+        QCheckBox::indicator:checked {{
+            background: {t.accent}; border-color: {t.accent}; image: url({check_icon(t)});
+        }}
+        QPushButton {{
+            color: {t.text}; background: {t.card}; border: 1px solid {t.border};
+            border-radius: {BUTTON_RADIUS}px; padding: 5px 12px;
+        }}
+        QPushButton:hover {{ background: {t.card_hover}; }}
+        QPushButton:disabled {{ color: {t.muted}; }}
         QListView, QScrollArea, #chips {{ background: transparent; border: none; }}
         QScrollBar:vertical {{ background: transparent; width: 8px; margin: 2px; }}
         QScrollBar::handle:vertical {{ background: {t.border}; border-radius: 3px; min-height: 24px; }}

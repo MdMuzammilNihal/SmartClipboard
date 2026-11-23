@@ -18,6 +18,9 @@ LABELED_LOG_FILE_NAME = "labeled.db"
 # Window layout choices (search bar and filter chips shown or hidden). Plain
 # JSON with two true/false values; never any clipboard content.
 WINDOW_PREFS_FILE_NAME = "window.json"
+# Settings chosen in the settings panel (settings.py): numbers, true/false
+# values, a font choice and the excluded app names; never clipboard content.
+SETTINGS_FILE_NAME = "settings.json"
 
 
 @dataclass(frozen=True)
@@ -147,3 +150,8 @@ def labeled_log_path() -> Path:
 def window_prefs_path() -> Path:
     """Return the path of the window layout choices (ui/prefs.py)."""
     return app_data_dir() / WINDOW_PREFS_FILE_NAME
+
+
+def settings_path() -> Path:
+    """Return the path of the in-app settings file (settings.py)."""
+    return app_data_dir() / SETTINGS_FILE_NAME

@@ -43,7 +43,7 @@ from smartclip.ui.window import (  # noqa: E402
     card_rects,
     clear_question,
     card_tooltip,
-    delete_question_box,
+    question_box,
     place_near,
     present_filters,
     region_at,
@@ -112,6 +112,13 @@ class FakeBackend:
         self.calls.append(("delete", item_id))
         return self.store.pop(item_id, None) is not None
 
+    def restore(self, items: list[StoredItem]) -> int:
+        self.calls.append(("restore", len(items)))
+        for item in items:
+            new_id = max(self.store, default=0) + 1
+            self.store[new_id] = replace(item, id=new_id)
+        return len(items)
+
     def mark_normal(self, item_id: int) -> bool:
         self.calls.append(("mark_normal", item_id))
         return self._set(item_id, secret_state=SecretState.NORMAL)
@@ -163,7 +170,7 @@ def clock() -> Clock:
 
 @pytest.fixture
 def window(qapp: QApplication, backend: FakeBackend, clock: Clock) -> Iterator[SearchWindow]:
-    win = SearchWindow(backend, now=clock, confirm_delete=lambda _parent: True)
+    win = SearchWindow(backend, now=clock)
     win.show_and_focus()
     yield win
     win.hide()
@@ -320,7 +327,7 @@ def test_hiding_the_window_masks_every_reveal(window: SearchWindow) -> None:
 
 
 def test_masked_row_never_exposes_content_in_any_role(window: SearchWindow) -> None:
-    index = window.model.index(window.model.rows.index(row_of(window, 3)))
+    index = window.model.index(window.model.position_of(3))
     for role in list(range(0, 64)) + [ROW_ROLE]:
         assert FAKE_SECRET_TEXT not in str(window.model.data(index, role))
 
@@ -455,22 +462,33 @@ def test_mark_secret_not_offered_for_secret_rows(
     assert row_of(window, 1).preview == MASK
 
 
-def test_delete_asks_first(qapp: QApplication, backend: FakeBackend, clock: Clock) -> None:
-    answers: list[bool] = [False, True]
-    win = SearchWindow(backend, now=clock, confirm_delete=lambda _parent: answers.pop(0))
+def test_delete_is_immediate_and_offers_undo(
+    qapp: QApplication, backend: FakeBackend, clock: Clock
+) -> None:
+    win = SearchWindow(backend, now=clock)
     win.show_and_focus()
     menu_action(win, 1, "Delete").trigger()
-    assert backend.calls == []
-    win.shortcuts["Shift+Del"].activated.emit()
     assert backend.calls == [("delete", 1)]
     assert 1 not in [row.item_id for row in win.model.rows]
+    assert win.toast.is_active and win.toast.label.text() == "Item deleted"
+    assert win.toast.action_button.text() == "Undo"
     win.hide()
 
 
-def test_delete_question_stays_above_the_on_top_window(window: SearchWindow) -> None:
+def test_shift_del_deletes_the_selected_card(
+    qapp: QApplication, backend: FakeBackend, clock: Clock
+) -> None:
+    win = SearchWindow(backend, now=clock)
+    win.show_and_focus()
+    win.shortcuts["Shift+Del"].activated.emit()
+    assert backend.calls == [("delete", 1)]
+    win.hide()
+
+
+def test_question_box_stays_above_the_on_top_window(window: SearchWindow) -> None:
     # The window is always on top; an ordinary dialog could sit behind it.
     assert window.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
-    box = delete_question_box(window)
+    box = question_box(window, "Clear all", clear_question(2))
     assert box.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
     assert box.parent() is window
     assert box.windowModality() == Qt.WindowModality.ApplicationModal
@@ -717,11 +735,11 @@ def test_button_clicks_act_on_their_card(window: SearchWindow, backend: FakeBack
     assert backend.calls[-1] == ("delete", 1)
 
 
-def test_button_delete_still_asks(qapp: QApplication, backend: FakeBackend, clock: Clock) -> None:
-    win = SearchWindow(backend, now=clock, confirm_delete=lambda _parent: False)
+def test_button_delete_deletes_at_once(qapp: QApplication, backend: FakeBackend, clock: Clock) -> None:
+    win = SearchWindow(backend, now=clock)
     win.show_and_focus()
     click(win, 1, REGION_DELETE)
-    assert ("delete", 1) not in backend.calls
+    assert ("delete", 1) in backend.calls
     win.hide()
 
 

@@ -131,6 +131,9 @@ class Paster(QObject):
         self._now = now
         self._target: int | None = None
         self._pending: tuple[int, int, datetime] | None = None  # target, sequence, deadline
+        # Called when the item was copied but not pasted, so the owner can be
+        # told to press Ctrl+V themselves (UI plan item 5). Set by the window.
+        self.on_copy_only: Callable[[], None] | None = None
         self._timer = QTimer(self)
         self._timer.setInterval(STEP_MS)
         self._timer.timeout.connect(self.step)
@@ -153,6 +156,7 @@ class Paster(QObject):
         target = self._target
         if target is None or not self._api.window_exists(target):
             logsafe.log_event(_log, "paste_skipped_no_target")
+            self._copy_only()
             return True
         # While this app is still in front it may hand the focus back.
         self._api.set_foreground(target)
@@ -182,6 +186,12 @@ class Paster(QObject):
             else:
                 reason = "paste_skipped_keys_held"
             logsafe.log_event(_log, reason)
+            if written:
+                self._copy_only()  # on the clipboard, not pasted
+
+    def _copy_only(self) -> None:
+        if self.on_copy_only is not None:
+            self.on_copy_only()
 
     def _finish(self) -> None:
         self._pending = None
