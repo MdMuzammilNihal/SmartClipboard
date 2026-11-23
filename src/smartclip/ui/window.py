@@ -465,7 +465,8 @@ class CardDelegate(QStyledItemDelegate):
         background = t.card_selected if selected else t.card_hover if hovered else t.card
         painter.setBrush(QColor(background))
         painter.setPen(QPen(QColor(t.accent if selected else t.border), 1))
-        painter.drawRoundedRect(rects.card.adjusted(0, 0, -1, -1), 8, 8)
+        radius = themes.CARD_RADIUS
+        painter.drawRoundedRect(rects.card.adjusted(0, 0, -1, -1), radius, radius)
 
         if rects.label is not None:
             self._badge(painter, rects.label, row.label_badge)
@@ -513,7 +514,8 @@ class CardDelegate(QStyledItemDelegate):
     def _badge(self, painter: QPainter, rect: QRect, badge: Badge) -> None:
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(badge.background))
-        painter.drawRoundedRect(rect, 6, 6)
+        pill = rect.height() / 2  # fully round ends (UI plan item 11)
+        painter.drawRoundedRect(rect, pill, pill)
         painter.setPen(QColor(badge.foreground))
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, badge.text)
 

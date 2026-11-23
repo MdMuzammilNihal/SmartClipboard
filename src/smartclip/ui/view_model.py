@@ -55,7 +55,8 @@ class Badge:
 # unsure is amber; the type colours only need to be easy to tell apart.
 LABEL_BADGES: dict[Label, Badge] = {
     Label.LINK: Badge("Link", "#1c7ed6"),
-    Label.CODE: Badge("Code", "#7048e8"),
+    # Pink, not purple: purple is the accent colour (owner's decision 2026-11-24).
+    Label.CODE: Badge("Code", "#d6336c"),
     Label.JSON: Badge("JSON", "#0c8599"),
     Label.SHELL_COMMAND: Badge("Shell", "#343a40"),
     Label.FILE_PATH: Badge("Path", "#9c6b30"),

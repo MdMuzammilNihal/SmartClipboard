@@ -350,7 +350,7 @@ def main() -> int:
     from smartclip.hotkeys import HotkeyError, HotkeyListener, parse_hotkey
     from smartclip.listener import ClipboardListener, ListenerError
     from smartclip.storage import Store
-    from smartclip.ui import capture_guard
+    from smartclip.ui import capture_guard, typeface
     from smartclip.ui.paste import Paster
     from smartclip.ui.prefs import JsonPrefs
     from smartclip.ui.window import SearchWindow
@@ -360,6 +360,8 @@ def main() -> int:
     logsafe.install_crash_handlers()
     qt_app = QApplication(sys.argv)
     qt_app.setQuitOnLastWindowClosed(False)
+    typeface.load_bundled_fonts()
+    qt_app.setFont(typeface.app_font())
     if config.EXCLUDE_FROM_SCREEN_CAPTURE:
         # Installed first, so every window this app shows is covered: the
         # search window, its tooltips, menus, and dialogs, and the start-up

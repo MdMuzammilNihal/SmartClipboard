@@ -3,6 +3,11 @@
 Owner's decision (2026-11-19): the window follows the Windows light/dark
 setting, read each time it opens (Qt reports it through styleHints()).
 The badge colours (view_model.py) are the same in both themes.
+
+Owner's decision (2026-11-24, UI plan milestone M0): the palette is the
+purple design system shared with the owner's Dataset Factory dashboard.
+Blended colours (hover, selected, banner) are worked out ahead of time as
+solid colours, because Qt style sheets handle transparency less reliably.
 """
 
 from dataclasses import dataclass
@@ -28,39 +33,75 @@ class Theme:
     input: str
     banner_background: str
     banner_text: str
+    # Status colours, for later items (countdown pill, toasts, Insights).
+    success: str
+    warning: str
+    danger: str
+    # Tinted card backgrounds for the planned Insights cards.
+    tint1: str
+    tint2: str
+    tint3: str
+    tint4: str
+    # End colour of the accent gradient used for bars.
+    accent_gradient_end: str
 
 
 LIGHT = Theme(
     name="light",
-    window="#f3f3f3",
+    window="#f1f2f8",
     card="#ffffff",
-    card_hover="#f5f8fc",
-    card_selected="#e5f0fb",
-    border="#e0e0e0",
-    accent="#0f6cbd",
+    card_hover="#f3f2fd",
+    card_selected="#eae8fc",
+    border="#e7e8f1",
+    accent="#6c5ce7",
     accent_text="#ffffff",
-    text="#1b1b1b",
-    muted="#666666",
+    text="#1b1d2e",
+    muted="#6b7089",
     input="#ffffff",
-    banner_background="#fde7e9",
-    banner_text="#a4262c",
+    # Danger at 10% over white. The plan's #ebd9dd gave only 4.0:1 with the
+    # banner text (calculated in tests/test_theme.py), below 4.5:1.
+    banner_background="#f9ebea",
+    banner_text="#c2352b",
+    success="#14894f",
+    warning="#b7791f",
+    danger="#c2352b",
+    tint1="#efeafe",
+    tint2="#e3f6ee",
+    tint3="#fdf0dc",
+    tint4="#e4eefe",
+    accent_gradient_end="#a99dff",
 )
 
 DARK = Theme(
     name="dark",
-    window="#202020",
-    card="#2c2c2c",
-    card_hover="#333333",
-    card_selected="#2d3a49",
-    border="#3b3b3b",
-    accent="#4cc2ff",
-    accent_text="#000000",
-    text="#f3f3f3",
-    muted="#a6a6a6",
-    input="#2c2c2c",
-    banner_background="#442726",
-    banner_text="#ff99a4",
+    window="#0e1017",
+    card="#171a25",
+    card_hover="#25273f",
+    card_selected="#2d2d4c",
+    border="#272b3b",
+    accent="#8f83ff",
+    # White on #8f83ff is about 3.1:1 and fails; dark text passes.
+    accent_text="#0e1017",
+    text="#e8eaf2",
+    muted="#8e93aa",
+    input="#171a25",
+    banner_background="#392327",
+    banner_text="#ff7a6e",
+    success="#3ccf82",
+    warning="#e0b04a",
+    danger="#ff7a6e",
+    tint1="#241f45",
+    tint2="#14301f",
+    tint3="#392c14",
+    tint4="#16294a",
+    accent_gradient_end="#a99dff",
 )
+
+# Corner radii in pixels (UI plan item 11). Chips and badges are pills
+# (badges are drawn with half their height as the radius, in window.py).
+WINDOW_RADIUS = 14
+CARD_RADIUS = 12
+BUTTON_RADIUS = 10
 
 
 def theme_for(scheme: Qt.ColorScheme) -> Theme:
@@ -77,20 +118,24 @@ def stylesheet(theme: Theme) -> str:
     """The Qt style sheet for the window and its menus."""
     t = theme
     return f"""
-        #panel {{ background: {t.window}; border: 1px solid {t.border}; border-radius: 8px; }}
+        #panel {{
+            background: {t.window}; border: 1px solid {t.border};
+            border-radius: {WINDOW_RADIUS}px;
+        }}
         QLabel {{ color: {t.text}; background: transparent; }}
         #muted, #status {{ color: {t.muted}; }}
         #banner {{
             background: {t.banner_background}; color: {t.banner_text};
-            border-radius: 6px; padding: 5px 8px; font-weight: bold;
+            border-radius: {BUTTON_RADIUS}px; padding: 5px 8px; font-weight: 600;
         }}
         #search {{
             background: {t.input}; color: {t.text}; border: 1px solid {t.border};
-            border-bottom: 2px solid {t.accent}; border-radius: 6px; padding: 6px 8px;
+            border-bottom: 2px solid {t.accent}; border-radius: {BUTTON_RADIUS}px;
+            padding: 6px 8px;
         }}
         QToolButton {{
             color: {t.text}; background: transparent; border: none;
-            border-radius: 6px; padding: 4px; min-width: 28px; min-height: 28px;
+            border-radius: {BUTTON_RADIUS}px; padding: 4px; min-width: 28px; min-height: 28px;
         }}
         QToolButton:hover {{ background: {t.card_hover}; }}
         QToolButton::menu-indicator {{ image: none; width: 0px; }}
@@ -110,9 +155,9 @@ def stylesheet(theme: Theme) -> str:
         QScrollBar::add-line, QScrollBar::sub-line {{ width: 0px; height: 0px; }}
         QMenu {{
             background: {t.card}; color: {t.text}; border: 1px solid {t.border};
-            border-radius: 6px; padding: 4px;
+            border-radius: {BUTTON_RADIUS}px; padding: 4px;
         }}
-        QMenu::item {{ padding: 6px 18px; border-radius: 4px; }}
+        QMenu::item {{ padding: 6px 18px; border-radius: 6px; }}
         QMenu::item:selected {{ background: {t.card_selected}; }}
         QMenu::item:disabled {{ color: {t.muted}; }}
         QMenu::separator {{ height: 1px; background: {t.border}; margin: 4px 6px; }}

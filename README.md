@@ -32,7 +32,7 @@ Win+V keeps about 25 items, has no real search or labels, and loses history on r
 | | |
 |---|---|
 | Code | about 6,600 lines of source, 7,200 lines of tests, 28 modules |
-| Tests | 710 passing, all on fake data (12 opt-in real-clipboard tests, 17 known mislabels recorded as expected failures) |
+| Tests | 722 passing, all on fake data (12 opt-in real-clipboard tests, 17 known mislabels recorded as expected failures) |
 | Dependencies | `pywin32`, `PySide6`, pinned `winrt-*` packages (Win+V cleanup); no network libraries |
 | Status | Phase 1 built; a week of daily use under way (started 2026-11-19) |
 
@@ -83,3 +83,5 @@ Two automated tests: app code imports no networking module, and the app's flows 
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+The window uses IBM Plex Serif, bundled unchanged in `src/smartclip/ui/fonts/` under the SIL Open Font License 1.1 ([OFL.txt](src/smartclip/ui/fonts/OFL.txt)). It is loaded from disk; no font is fetched from the internet.
