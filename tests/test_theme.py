@@ -51,3 +51,17 @@ def test_code_badge_is_not_the_accent_purple() -> None:
 def test_state_badges_are_readable() -> None:
     for badge in STATE_BADGES.values():
         assert contrast(badge.foreground, badge.background) >= 4.5
+
+
+@pytest.mark.parametrize("t", [theme.LIGHT, theme.DARK], ids=["light", "dark"])
+def test_small_text_on_tinted_cards_and_the_tab_bar_is_readable(t: theme.Theme) -> None:
+    for tint in (t.tint1, t.tint2, t.tint3, t.tint4, t.border):
+        assert contrast(t.muted_strong, tint) >= 4.5
+    for tint in (t.tint1, t.tint2, t.tint3, t.tint4):
+        assert contrast(t.text, tint) >= 4.5
+    assert contrast(t.text, t.card) >= 4.5  # the selected tab
+
+
+@pytest.mark.parametrize("t", [theme.LIGHT, theme.DARK], ids=["light", "dark"])
+def test_tag_chip_text_is_readable(t: theme.Theme) -> None:
+    assert contrast(t.accent, t.card) >= 4.5  # the chips are card-coloured

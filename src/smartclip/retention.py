@@ -125,6 +125,8 @@ def merge_recopy(
         pinned=False,
         expires_at=expires_at,
         last_copied_at=now,
+        title=None,  # secrets cannot be titled or tagged (naming.py)
+        tags=(),
     )
 
 

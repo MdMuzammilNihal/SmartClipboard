@@ -27,7 +27,6 @@ def test_defaults_come_from_config() -> None:
     assert s.excluded_apps == ()
     assert s.pause_on_start is False
     assert s.font == "plex"
-    assert s.show_hints is True
 
 
 def test_missing_file_gives_defaults(tmp_path: Path) -> None:
@@ -51,11 +50,10 @@ def test_round_trip(tmp_path: Path) -> None:
     store = JsonSettings(tmp_path / "settings.json")
     wanted = Settings(
         normal_retention_days=30,
-        secret_retention_minutes=45,
+        secret_retention_hours=3,
         excluded_apps=("fakemanager.exe", "fakebank.exe"),
         pause_on_start=True,
         font="system",
-        show_hints=False,
     )
     assert store.save(wanted) is True
     assert store.load() == wanted
@@ -70,9 +68,9 @@ def test_round_trip(tmp_path: Path) -> None:
         ("normal_retention_days", "90"),
         ("normal_retention_days", True),
         ("normal_retention_days", 3.5),
-        ("secret_retention_minutes", 1),
-        ("secret_retention_minutes", 100000),
-        ("secret_retention_minutes", None),
+        ("secret_retention_hours", 0),
+        ("secret_retention_hours", 100),
+        ("secret_retention_hours", None),
     ],
 )
 def test_out_of_range_number_falls_back_to_its_default(field: str, bad: object) -> None:
@@ -82,22 +80,32 @@ def test_out_of_range_number_falls_back_to_its_default(field: str, bad: object) 
 
 def test_one_bad_value_does_not_spoil_the_rest() -> None:
     loaded = from_raw(
-        {"normal_retention_days": 0, "secret_retention_minutes": 30, "pause_on_start": True}
+        {"normal_retention_days": 0, "secret_retention_hours": 6, "pause_on_start": True}
     )
     assert loaded.normal_retention_days == Settings().normal_retention_days
-    assert loaded.secret_retention_minutes == 30
+    assert loaded.secret_retention_hours == 6
     assert loaded.pause_on_start is True
 
 
 def test_limits_themselves_are_allowed() -> None:
     assert from_raw({"normal_retention_days": 1}).normal_retention == timedelta(days=1)
     assert from_raw({"normal_retention_days": 3650}).normal_retention_days == 3650
-    assert from_raw({"secret_retention_minutes": 5}).secret_retention_minutes == 5
-    assert from_raw({"secret_retention_minutes": 1440}).secret_retention_minutes == 1440
+    assert from_raw({"secret_retention_hours": 1}).secret_retention_hours == 1
+    assert from_raw({"secret_retention_hours": 24}).secret_retention_hours == 24
+
+
+@pytest.mark.parametrize("minutes, hours", [(5, 1), (60, 1), (61, 2), (120, 2), (1440, 24)])
+def test_an_old_file_with_minutes_is_rounded_up_to_whole_hours(minutes: int, hours: int) -> None:
+    assert from_raw({"secret_retention_minutes": minutes}).secret_retention_hours == hours
+
+
+def test_hours_win_over_an_old_minutes_value() -> None:
+    raw = {"secret_retention_hours": 4, "secret_retention_minutes": 30}
+    assert from_raw(raw).secret_retention_hours == 4
 
 
 def test_bad_true_false_and_font_fall_back() -> None:
-    loaded = from_raw({"pause_on_start": "yes", "show_hints": 1, "font": "comic"})
+    loaded = from_raw({"pause_on_start": "yes", "font": "comic"})
     assert loaded == Settings()
 
 

@@ -71,12 +71,13 @@ import importlib.metadata
 import queue
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol
 
-from smartclip import classify, config, logsafe, overrides, retention, secret_rules
+from smartclip import classify, config, logsafe, naming, overrides, retention, secret_rules
 from smartclip.datalog import LabeledLog, RecordEvent
 from smartclip.dedupe import DedupeKey, DedupeKeyError
 from smartclip.gate import Gate, PauseSwitch
@@ -295,6 +296,36 @@ class AppBackend:
         logsafe.log_event(_log, "item_deleted", item_id=item_id, deleted=deleted)
         return deleted
 
+    def rename(self, item_id: int, title: str | None) -> bool:
+        """Give a pinned, non-secret item a title (None or empty removes it).
+
+        Returns False for a missing, unpinned or secret item. The title is
+        stored encrypted with the item and never logged (naming.py).
+        """
+        item = self._history.get(item_id)
+        if item is None or not self._may_be_named(item.payload):
+            return False
+        clean = naming.clean_title(title) if title else None
+        changed = self._history.update(item_id, replace(item.payload, title=clean))
+        logsafe.log_event(_log, "item_renamed", item_id=item_id, has_title=clean is not None)
+        return changed
+
+    def set_tags(self, item_id: int, tags: tuple[str, ...]) -> bool:
+        """Replace a pinned, non-secret item's tags (at most three, no repeats)."""
+        item = self._history.get(item_id)
+        if item is None or not self._may_be_named(item.payload):
+            return False
+        cleaned: tuple[str, ...] = ()
+        for tag in tags:
+            cleaned = naming.add_tag(cleaned, tag)
+        changed = self._history.update(item_id, replace(item.payload, tags=cleaned))
+        logsafe.log_event(_log, "item_tagged", item_id=item_id, tags=len(cleaned))
+        return changed
+
+    @staticmethod
+    def _may_be_named(payload: ItemPayload) -> bool:
+        return payload.pinned and not retention.is_sensitive(payload)
+
     def restore(self, items: list[StoredItem]) -> int:
         """Undo a delete: put the items back. Returns how many were restored."""
         restored = self._history.restore(items, self._now())
@@ -390,8 +421,7 @@ def main() -> int:
     from smartclip.storage import Store
     from smartclip.ui import capture_guard, typeface
     from smartclip.ui.paste import Paster
-    from smartclip.ui.prefs import JsonPrefs
-    from smartclip.ui.settings_dialog import SettingsPanel, open_folder
+    from smartclip.ui.settings_dialog import SettingsPanel
     from smartclip.ui.window import SearchWindow
     from smartclip.winhistory import HistoryCleaner
 
@@ -459,7 +489,6 @@ def main() -> int:
 
     def on_settings_changed(changed: Settings) -> None:
         apply_settings(changed, history, gate, set_font)
-        window.set_hints_visible(changed.show_hints)
         window.refresh()
 
     switches = [AutostartSwitch(), ShortcutSwitch()]
@@ -469,7 +498,6 @@ def main() -> int:
             settings_store,
             on_settings_changed,
             switches=switches,
-            show_data_folder=lambda: open_folder(config.app_data_dir()),
             version=app_version(),
             parent=parent,
         )
@@ -477,11 +505,8 @@ def main() -> int:
     window = SearchWindow(
         backend,
         paster=Paster() if config.PASTE_ON_CHOOSE else None,
-        switches=switches,
-        prefs=JsonPrefs(config.window_prefs_path()),
+        start_open=False,  # the top bar starts folded (owner's decision 2026-11-25)
         settings_panel_factory=make_panel,
-        show_hints=settings.show_hints,
-        pause_keys=config.HOTKEY_PAUSE,
     )
 
     class HotkeyBridge(QObject):

@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
 from smartclip.labels import Label  # noqa: E402
 from smartclip.ui.toast import Toast  # noqa: E402
+from qt_wait import wait_for  # noqa: E402
 from smartclip.ui.window import (  # noqa: E402
     SearchWindow,
     clear_text,
@@ -58,8 +59,8 @@ def test_toast_finishes_exactly_once_whichever_way_it_ends(qapp: QApplication) -
     toast.finished.connect(lambda: finished.append(1))
 
     toast.show_message("one")  # ends by itself
-    QTest.qWait(80)
-    assert finished == [1] and not toast.is_active
+    assert wait_for(lambda: finished == [1], 3000)
+    assert not toast.is_active
 
     toast.show_message("two")  # dismissed
     toast.dismiss()
@@ -95,10 +96,9 @@ def test_toast_fades_out_before_finishing(qapp: QApplication) -> None:
     done: list[int] = []
     toast.finished.connect(lambda: done.append(1))
     toast.show_message("hello")
-    QTest.qWait(30)
-    assert done == []  # still on screen in the fade
-    QTest.qWait(200)
-    assert done == [1]
+    assert wait_for(lambda: toast._fading_out, 3000)  # the fade has begun...
+    assert done == [] and toast.is_active  # ...and the message is still on screen
+    assert wait_for(lambda: done == [1], 3000)
 
 
 # --- Delete and Undo ---
@@ -143,8 +143,8 @@ def test_the_kept_items_are_dropped_when_the_time_runs_out(
     win.show_and_focus()
     win.delete(win.model.rows[0])
     assert len(win._undo_items) == 1
-    QTest.qWait(300)
-    assert win._undo_items == [] and not win.toast.is_active
+    assert wait_for(lambda: win._undo_items == [], 3000)
+    assert not wait_for(lambda: win.toast.is_active, 300)
     win.undo_delete()  # too late: nothing to restore
     assert not any(call[0] == "restore" for call in backend.calls)
     win.hide()
@@ -192,9 +192,9 @@ def test_deleting_something_already_gone_offers_no_undo(
     assert not window.toast.is_active
 
 
-def test_toast_is_placed_inside_the_window_above_the_hint_bar(window: SearchWindow) -> None:
+def test_toast_is_placed_inside_the_window_at_the_bottom(window: SearchWindow) -> None:
     window.delete(window.model.rows[0])
-    assert window.toast.geometry().bottom() <= window.hint_label.y()
+    assert window.toast.geometry().bottom() <= window.height()
     assert window.toast.geometry().left() >= 0
     assert window.toast.geometry().right() <= window.width()
 

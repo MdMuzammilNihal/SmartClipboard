@@ -15,9 +15,6 @@ DATABASE_FILE_NAME = "items.db"
 LOG_DIR_NAME = "logs"
 DEDUPE_KEY_FILE_NAME = "dedupe.key"
 LABELED_LOG_FILE_NAME = "labeled.db"
-# Window layout choices (search bar and filter chips shown or hidden). Plain
-# JSON with two true/false values; never any clipboard content.
-WINDOW_PREFS_FILE_NAME = "window.json"
 # Settings chosen in the settings panel (settings.py): numbers, true/false
 # values, a font choice and the excluded app names; never clipboard content.
 SETTINGS_FILE_NAME = "settings.json"
@@ -145,11 +142,6 @@ def log_dir() -> Path:
 def labeled_log_path() -> Path:
     """Return the path of the opt-in labeled-data log (task 20)."""
     return app_data_dir() / LABELED_LOG_FILE_NAME
-
-
-def window_prefs_path() -> Path:
-    """Return the path of the window layout choices (ui/prefs.py)."""
-    return app_data_dir() / WINDOW_PREFS_FILE_NAME
 
 
 def settings_path() -> Path:

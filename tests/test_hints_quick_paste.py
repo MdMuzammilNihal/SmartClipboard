@@ -1,4 +1,4 @@
-"""The hint bar and Alt+1 to Alt+9 quick paste (UI plan item 3). Fake data only."""
+"""Alt+1 to Alt+9 quick paste and the card numbers (UI plan item 3). Fake data only."""
 
 import os
 from collections.abc import Iterator
@@ -15,7 +15,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from smartclip.labels import Label  # noqa: E402
 from smartclip.storage import ItemPayload, StoredItem  # noqa: E402
-from smartclip.ui.view_model import Header, RevealState, build_rows, hint_text  # noqa: E402
+from smartclip.ui.view_model import Header  # noqa: E402
 from smartclip.ui.window import NUMBER_ROLE, SearchWindow  # noqa: E402
 from test_view_model import LINK, NOW, SECRET  # noqa: E402
 from test_window import FAKE_SECRET_TEXT, START, Clock, FakeBackend, FakePaster  # noqa: E402
@@ -51,71 +51,6 @@ def number_of(window: SearchWindow, item_id: int) -> object:
     position = window.model.position_of(item_id)
     assert position is not None
     return window.model.data(window.model.index(position), NUMBER_ROLE)
-
-
-# --- The hint text ---
-
-
-def test_hint_for_a_normal_card_offers_pin() -> None:
-    [row] = build_rows([LINK], "", None, RevealState(), NOW)
-    text = hint_text(row, paused=False, pause_keys="Ctrl+Alt+P")
-    assert "Enter paste" in text and "Ctrl+P pin" in text
-    assert "Alt+1-9 quick paste" in text and "Esc close" in text
-    assert "reveal" not in text
-
-
-def test_hint_for_a_secret_offers_reveal_and_for_a_pinned_card_unpin() -> None:
-    [secret] = build_rows([SECRET], "", None, RevealState(), NOW)
-    assert "Ctrl+R reveal" in hint_text(secret, False, "Ctrl+Alt+P")
-    [link] = build_rows([LINK], "", None, RevealState(), NOW)
-    assert "Ctrl+P unpin" in hint_text(replace(link, pinned=True), False, "Ctrl+Alt+P")
-
-
-def test_hint_when_paused_says_how_to_resume() -> None:
-    assert "Ctrl+Alt+P resumes capture" in hint_text(None, True, "Ctrl+Alt+P")
-
-
-def test_hint_with_nothing_selected_is_short() -> None:
-    text = hint_text(None, False, "Ctrl+Alt+P")
-    assert "pin" not in text and "reveal" not in text and "Esc close" in text
-
-
-# --- The hint bar in the window ---
-
-
-def test_hint_bar_follows_the_selection(window: SearchWindow) -> None:
-    window.select_item(2)  # a normal card
-    assert "Ctrl+P pin" in window.hint_label.text()
-    window.select_item(3)  # the masked secret
-    assert "Ctrl+R reveal" in window.hint_label.text()
-
-
-def test_hint_bar_follows_pause(window: SearchWindow, backend: FakeBackend) -> None:
-    window.toggle_pause()
-    assert "resumes capture" in window.hint_label.text()
-    window.toggle_pause()
-    assert "resumes capture" not in window.hint_label.text()
-
-
-def test_hint_bar_can_be_switched_off_and_on(window: SearchWindow) -> None:
-    assert not window.hint_label.isHidden()
-    window.set_hints_visible(False)
-    assert window.hint_label.isHidden()
-    window.set_hints_visible(True)
-    assert not window.hint_label.isHidden()
-
-
-def test_hint_bar_starts_hidden_when_the_setting_is_off(qapp: QApplication) -> None:
-    win = SearchWindow(FakeBackend(), now=Clock(), show_hints=False)
-    win.show_and_focus()
-    assert win.hint_label.isHidden()
-
-
-def test_hint_never_holds_item_text(window: SearchWindow) -> None:
-    for row in window.model.rows:
-        window.select_item(row.item_id)
-        assert FAKE_SECRET_TEXT not in window.hint_label.text()
-        assert "FAKE" not in window.hint_label.text()
 
 
 # --- Numbers on the cards ---

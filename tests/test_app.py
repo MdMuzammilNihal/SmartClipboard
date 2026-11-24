@@ -226,6 +226,85 @@ def test_delete_forgets_last_capture(backend: AppBackend, history: History) -> N
     assert backend.delete(item_id) is False
 
 
+FAKE_TITLE = "FAKE-title-Standup-link"
+FAKE_TAG = "FAKE-tag-work"
+
+
+def test_rename_and_tags_work_on_a_pinned_item_and_survive_a_reload(
+    backend: AppBackend, history: History, store: Store
+) -> None:
+    item_id = backend.handle_event(event(FAKE_NOTE, 1))
+    backend.pin(item_id)
+    assert backend.rename(item_id, f"  {FAKE_TITLE}  ") is True
+    assert backend.set_tags(item_id, (FAKE_TAG, "second", "SECOND", "third", "fourth")) is True
+    payload = history.get(item_id).payload  # type: ignore[union-attr]
+    assert payload.title == FAKE_TITLE and payload.tags == (FAKE_TAG, "second", "third")
+    again = History(store, KEY, POLICY)
+    again.load()
+    kept = again.get(item_id)
+    assert kept is not None and kept.payload.title == FAKE_TITLE and kept.payload.pinned is True
+
+
+def test_naming_is_refused_for_unpinned_secret_and_missing_items(
+    backend: AppBackend, history: History
+) -> None:
+    plain = backend.handle_event(event(FAKE_NOTE, 1))  # not pinned
+    secret = backend.handle_event(event(FAKE_TOKEN, 2))
+    assert history.get(secret).payload.secret_state is SecretState.SECRET  # type: ignore[union-attr]
+    for item_id in (plain, secret, 999):
+        assert backend.rename(item_id, FAKE_TITLE) is False
+        assert backend.set_tags(item_id, (FAKE_TAG,)) is False
+    assert history.get(plain).payload.title is None  # type: ignore[union-attr]
+
+
+def test_an_empty_title_removes_the_name_and_no_tags_removes_the_tags(
+    backend: AppBackend, history: History
+) -> None:
+    item_id = backend.handle_event(event(FAKE_NOTE, 1))
+    backend.pin(item_id)
+    backend.rename(item_id, FAKE_TITLE)
+    backend.set_tags(item_id, (FAKE_TAG,))
+    backend.rename(item_id, "   ")
+    backend.set_tags(item_id, ())
+    payload = history.get(item_id).payload  # type: ignore[union-attr]
+    assert payload.title is None and payload.tags == ()
+
+
+def test_marking_a_named_item_secret_clears_its_names(backend: AppBackend, history: History) -> None:
+    item_id = backend.handle_event(event(FAKE_NOTE, 1))
+    backend.pin(item_id)
+    backend.rename(item_id, FAKE_TITLE)
+    backend.set_tags(item_id, (FAKE_TAG,))
+    assert backend.mark_secret(item_id) is True
+    payload = history.get(item_id).payload  # type: ignore[union-attr]
+    assert payload.secret_state is SecretState.SECRET and payload.title is None and payload.tags == ()
+
+
+def test_copying_a_named_item_again_keeps_its_names(backend: AppBackend, history: History) -> None:
+    item_id = backend.handle_event(event(FAKE_NOTE, 1))
+    backend.pin(item_id)
+    backend.rename(item_id, FAKE_TITLE)
+    assert backend.handle_event(event(FAKE_NOTE, 2)) == item_id  # merged into the same item
+    assert history.get(item_id).payload.title == FAKE_TITLE  # type: ignore[union-attr]
+
+
+def test_titles_and_tags_are_never_logged(backend: AppBackend) -> None:
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    logsafe.attach_handler(handler)
+    try:
+        item_id = backend.handle_event(event(FAKE_NOTE, 1))
+        backend.pin(item_id)
+        backend.rename(item_id, FAKE_TITLE)
+        backend.set_tags(item_id, (FAKE_TAG,))
+        backend.mark_secret(item_id)
+    finally:
+        logging.getLogger(logsafe.ROOT_LOGGER_NAME).removeHandler(handler)
+    logged = stream.getvalue()
+    assert "item_renamed" in logged and "item_tagged" in logged
+    assert FAKE_TITLE not in logged and FAKE_TAG not in logged and FAKE_NOTE not in logged
+
+
 def test_restore_puts_deleted_items_back_with_their_pins(
     backend: AppBackend, history: History
 ) -> None:

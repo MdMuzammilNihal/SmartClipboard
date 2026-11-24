@@ -23,7 +23,6 @@ from PySide6.QtWidgets import QApplication, QMenu, QWidget  # noqa: E402
 from smartclip.labels import Label, SecretState  # noqa: E402
 from smartclip.storage import ItemPayload, StoredItem  # noqa: E402
 from smartclip.ui import theme  # noqa: E402
-from smartclip.ui.prefs import MemoryPrefs, WindowPrefs  # noqa: E402
 from smartclip.ui.view_model import MASK, Row  # noqa: E402
 from smartclip.ui.window import (  # noqa: E402
     EMPTY_TEXT,
@@ -32,8 +31,13 @@ from smartclip.ui.window import (  # noqa: E402
     REGION_DELETE,
     REGION_LABEL,
     REGION_MARK,
+    REGION_COPY,
+    REGION_EDIT,
     REGION_MENU,
+    REGION_PASTE,
+    REGION_STRIP,
     REGION_PIN,
+    card_height,
     REGION_REVEAL,
     REGION_STATE,
     REGION_TEXT,
@@ -123,9 +127,25 @@ class FakeBackend:
         self.calls.append(("mark_normal", item_id))
         return self._set(item_id, secret_state=SecretState.NORMAL)
 
+    def rename(self, item_id: int, title: str | None) -> bool:
+        self.calls.append(("rename", item_id))
+        item = self.store.get(item_id)
+        if item is None or not item.payload.pinned or item.payload.secret_state is not SecretState.NORMAL:
+            return False
+        return self._set(item_id, title=title)
+
+    def set_tags(self, item_id: int, tags: tuple[str, ...]) -> bool:
+        self.calls.append(("set_tags", item_id))
+        item = self.store.get(item_id)
+        if item is None or not item.payload.pinned or item.payload.secret_state is not SecretState.NORMAL:
+            return False
+        return self._set(item_id, tags=tags)
+
     def mark_secret(self, item_id: int) -> bool:
         self.calls.append(("mark_secret", item_id))
-        return self._set(item_id, secret_state=SecretState.SECRET, pinned=False)
+        return self._set(
+            item_id, secret_state=SecretState.SECRET, pinned=False, title=None, tags=()
+        )
 
     def is_paused(self) -> bool:
         return self.paused
@@ -276,7 +296,7 @@ def test_state_click_on_a_normal_card_chooses_it(
 
 def test_chips_list_only_what_is_in_the_history(window: SearchWindow) -> None:
     assert list(window.chips) == [
-        None, SecretState.SECRET, SecretState.UNSURE, Label.LINK, Label.NOTE, Label.POSSIBLE_SECRET,
+        None, SecretState.SECRET, SecretState.UNSURE, Label.LINK, Label.NOTE,
     ]
     window.chips[Label.NOTE].click()
     assert window.active_filter is Label.NOTE
@@ -503,19 +523,15 @@ def test_pause_indicator_follows_backend(window: SearchWindow, backend: FakeBack
     window.pause_button.click()
     assert backend.paused is True
     assert window.pause_label.isVisible()
-    assert window.pause_button.toolTip() == "Resume capture"
-    assert window.pause_action.text() == "Resume capture"
+    assert window.pause_button.toolTip().startswith("Resume capture")
 
 
-def test_close_hides_and_quit_is_in_the_more_menu(
+def test_close_hides_the_window_and_does_not_quit(
     window: SearchWindow, backend: FakeBackend
 ) -> None:
     window.close()
     assert not window.isVisible()
     assert ("quit", 0) not in backend.calls
-    window.show_and_focus()
-    window.quit_action.trigger()
-    assert ("quit", 0) in backend.calls
 
 
 def test_selection_follows_the_item_after_refresh(
@@ -666,41 +682,13 @@ class FakeSwitch:
         return self.works
 
 
-def test_switches_are_tick_boxes_that_follow_the_setting(
-    qapp: QApplication, backend: FakeBackend
-) -> None:
-    autostart_switch = FakeSwitch("Start with Windows")
-    win = SearchWindow(backend, switches=[autostart_switch])
-    [(switch, action)] = win.switch_actions
-    assert action.text() == "Start with Windows" and action.isCheckable()
-    win.sync_switches()
-    assert not action.isChecked()
-    action.trigger()  # ticks it
-    assert autostart_switch.on is True and action.isChecked()
-    autostart_switch.on = False  # changed outside the app
-    win.sync_switches()
-    assert not action.isChecked()
-
-
-def test_failed_switch_says_so_and_stays_unticked(
-    qapp: QApplication, backend: FakeBackend
-) -> None:
-    win = SearchWindow(backend, switches=[FakeSwitch("Start menu shortcut", works=False)])
-    win.show_and_focus()
-    [(_switch, action)] = win.switch_actions
-    action.trigger()
-    assert not action.isChecked()
-    assert win.status_label.text() == 'Could not change "Start menu shortcut"'
-    win.hide()
-
-
 # --- Card buttons (owner's decisions 2026-11-19) ---
 
 
-def test_card_buttons_depend_on_the_state(window: SearchWindow) -> None:
-    assert card_buttons(row_of(window, 1)) == [REGION_PIN, REGION_MARK, REGION_DELETE]
-    assert card_buttons(row_of(window, 3)) == [REGION_REVEAL, REGION_MARK, REGION_DELETE]
-    assert card_buttons(row_of(window, 4)) == [REGION_REVEAL, REGION_MARK, REGION_DELETE]
+def test_an_active_card_shows_only_pin_and_secrets_cannot_be_pinned(window: SearchWindow) -> None:
+    assert card_buttons(row_of(window, 1)) == [REGION_PIN]
+    assert card_buttons(row_of(window, 3)) == []  # secret: only "..." is left
+    assert card_buttons(row_of(window, 4)) == []
 
 
 def test_buttons_are_laid_out_only_on_an_active_card(qapp: QApplication) -> None:
@@ -715,7 +703,92 @@ def test_buttons_are_laid_out_only_on_an_active_card(qapp: QApplication) -> None
         assert region_at(active, rect.center()) == region
         assert not rect.intersects(active.menu)
         assert not rect.intersects(active.top_text)
-    assert active.top_text.width() < still.top_text.width()
+
+
+# --- The strip that slides in from "..." (owner's design, 2026-11-25) ---
+
+
+def test_strip_icons_depend_on_the_card() -> None:
+    from smartclip.ui.window import action_regions
+
+    normal = make_row()
+    secret = make_row(state=SecretState.SECRET, can_pin=False)
+    pinned = make_row(pinned=True, can_name=True)
+    assert action_regions(normal, paste=True) == [REGION_COPY, REGION_PASTE, REGION_MARK, REGION_DELETE]
+    assert action_regions(normal, paste=False) == [REGION_COPY, REGION_MARK, REGION_DELETE]
+    assert action_regions(secret, paste=True)[0] == REGION_REVEAL
+    assert REGION_EDIT in action_regions(pinned, paste=True)
+    assert REGION_EDIT not in action_regions(normal, paste=True) and REGION_EDIT not in action_regions(secret, True)
+
+
+def test_strip_slides_in_over_the_right_of_the_card(qapp: QApplication) -> None:
+    metrics = QFontMetrics(QFont())
+    row = make_row()
+    closed = card_rects(QRect(0, 0, 360, 100), row, metrics, active=True)
+    assert closed.strip is None and closed.actions == ()
+    half = card_rects(QRect(0, 0, 360, 100), row, metrics, active=True, slide=0.5)
+    full = card_rects(QRect(0, 0, 360, 100), row, metrics, active=True, slide=1.0)
+    assert half.strip is not None and full.strip is not None
+    assert 0 < half.strip.width() < full.strip.width()
+    assert full.strip.right() == full.card.right()  # anchored to the right edge
+    for region, icon in full.actions:
+        assert region_at(full, icon.center()) == region
+        assert full.strip.contains(icon) and full.card.contains(icon)
+    assert region_at(full, full.strip.topLeft() + QPoint(1, 1)) in (REGION_STRIP, full.actions[0][0])
+
+
+def test_strip_opens_and_closes_from_the_menu_button(window: SearchWindow) -> None:
+    window.delegate.animation_ms = 0
+    window.select_item(1)
+    click(window, 1, REGION_MENU)
+    assert window.delegate.is_open(1) and window.delegate.slide_for(1) == 1.0
+    click(window, 1, REGION_MENU)  # "..." again closes
+    assert window.delegate.actions_item is None
+    click(window, 1, REGION_MENU)
+    click(window, 1, REGION_STRIP)  # the strip's empty area closes it
+    assert window.delegate.actions_item is None
+
+
+def test_strip_actions_copy_paste_mark_and_delete(window: SearchWindow, backend: FakeBackend) -> None:
+    window.delegate.animation_ms = 0
+    click(window, 1, REGION_MENU)
+    click(window, 1, REGION_COPY)
+    assert ("copy_back", 1) in backend.calls
+    window.show_and_focus()
+    click(window, 2, REGION_MENU)
+    click(window, 2, REGION_MARK)
+    assert row_of(window, 2).state is SecretState.SECRET and window.delegate.actions_item is None
+    click(window, 2, REGION_MENU)
+    click(window, 2, REGION_DELETE)
+    assert ("delete", 2) in backend.calls
+
+
+def test_escape_closes_an_open_strip_before_hiding_the_window(window: SearchWindow) -> None:
+    window.delegate.animation_ms = 0
+    click(window, 1, REGION_MENU)
+    QTest.keyClick(window.search, Qt.Key.Key_Escape)
+    assert window.delegate.actions_item is None and window.isVisible()
+    QTest.keyClick(window.search, Qt.Key.Key_Escape)
+    assert not window.isVisible()
+
+
+def test_moving_the_selection_or_hiding_closes_the_strip(window: SearchWindow) -> None:
+    window.delegate.animation_ms = 0
+    click(window, 1, REGION_MENU)
+    window.select_item(2)
+    assert window.delegate.actions_item is None
+    click(window, 2, REGION_MENU)
+    window.hide()
+    assert window.delegate.actions_item is None
+
+
+def test_the_strip_animates_when_animation_is_on(window: SearchWindow) -> None:
+    window.delegate.animation_ms = 120
+    click(window, 1, REGION_MENU)
+    assert window.delegate.is_open(1)
+    from qt_wait import wait_for
+
+    assert wait_for(lambda: window.delegate.slide_for(1) >= 1.0)
 
 
 def test_button_clicks_act_on_their_card(window: SearchWindow, backend: FakeBackend) -> None:
@@ -751,62 +824,98 @@ def test_button_tooltips_never_hold_the_text(window: SearchWindow) -> None:
             assert tip and FAKE_SECRET_TEXT not in tip and "lunch" not in tip
 
 
-# --- Search bar and filters shown or hidden ---
+# --- The top bar that drops down (owner's design, 2026-11-25) ---
 
 
-def test_hiding_search_and_filters_is_remembered(
+def folded_window(backend: FakeBackend, clock: Clock) -> SearchWindow:
+    win = SearchWindow(backend, now=clock, start_open=False)
+    win.drawer_animation_ms = 0
+    win.show_and_focus()
+    return win
+
+
+def test_the_top_bar_starts_folded_when_asked_and_open_otherwise(
     qapp: QApplication, backend: FakeBackend, clock: Clock
 ) -> None:
-    store = MemoryPrefs()
-    win = SearchWindow(backend, now=clock, prefs=store)
-    win.show_and_focus()
-    win.search.setText("lunch")
-    win.show_search_action.trigger()
-    win.show_filters_action.trigger()
-    assert store.prefs == WindowPrefs(show_search=False, show_filters=False)
-    assert not win.search.isVisible() and not win.filters_row.isVisible()
-    assert win.search.text() == ""  # no hidden search left filtering
+    folded = folded_window(backend, clock)
+    assert not folded.drawer_open
+    assert not folded.search.isVisible() and not folded.filters_row.isVisible()
+    assert not folded.pause_button.isVisible() and not folded.settings_button.isVisible()
+    assert folded.handle.isVisible()
+    folded.hide()
+    opened = SearchWindow(backend, now=clock)
+    opened.show_and_focus()
+    assert opened.drawer_open and opened.search.isVisible() and opened.pause_button.isVisible()
+    opened.hide()
+
+
+def test_the_handle_drops_the_bar_down_and_folds_it_again(
+    qapp: QApplication, backend: FakeBackend, clock: Clock
+) -> None:
+    win = folded_window(backend, clock)
+    win.handle.click()
+    assert win.drawer_open and win.search.isVisible() and win.filters_row.isVisible()
+    assert win.pause_button.isVisible() and win.settings_button.isVisible()
+    assert "Hide" in win.handle.toolTip()
+    win.handle.click()
+    assert not win.drawer_open and not win.search.isVisible()
+    assert "Show" in win.handle.toolTip()
     win.hide()
-    again = SearchWindow(backend, now=clock, prefs=store)
-    again.show_and_focus()
-    assert not again.search.isVisible() and not again.filters_row.isVisible()
-    assert not again.show_search_action.isChecked()
-    again.show_search_action.trigger()
-    assert again.search.isVisible() and store.prefs.show_search
-    again.hide()
-    win.deleteLater()
-    again.deleteLater()
 
 
-def test_typing_brings_back_a_hidden_search_bar_for_now(
+def test_folding_the_bar_clears_the_search_and_filter(
     qapp: QApplication, backend: FakeBackend, clock: Clock
 ) -> None:
-    store = MemoryPrefs(WindowPrefs(show_search=False))
-    win = SearchWindow(backend, now=clock, prefs=store)
-    win.show_and_focus()
-    assert not win.search.isVisible()
+    win = folded_window(backend, clock)
+    win.handle.click()
+    win.search.setText("lunch")
+    win.set_filter(Label.NOTE)
+    assert len(win.model.rows) == 1
+    win.handle.click()  # fold: nothing hidden may keep filtering
+    assert win.search.text() == "" and win.active_filter is None
+    assert len(win.model.rows) == 4
+    win.hide()
+
+
+def test_typing_or_ctrl_f_opens_a_folded_bar(
+    qapp: QApplication, backend: FakeBackend, clock: Clock
+) -> None:
+    win = folded_window(backend, clock)
     QTest.keyClick(win, Qt.Key.Key_Down)
     assert win.selected_row().item_id == 2
     QTest.keyClicks(win, "l")
-    assert win.search.isVisible() and win.search.text() == "l"
-    assert store.prefs.show_search is False  # not saved
+    assert win.drawer_open and win.search.text() == "l"
     win.hide()
-    assert not win.search.isVisibleTo(win)
-    win.deleteLater()
+    win.show_and_focus()
+    assert not win.drawer_open  # a fresh opening starts folded again
+    win.shortcuts["Ctrl+F"].activated.emit()
+    assert win.drawer_open and win.search.text() == ""
+    win.hide()
 
 
-def test_badge_click_brings_back_hidden_filters_for_now(
+def test_choosing_a_filter_opens_a_folded_bar_so_it_can_be_cleared(
     qapp: QApplication, backend: FakeBackend, clock: Clock
 ) -> None:
-    win = SearchWindow(backend, now=clock, prefs=MemoryPrefs(WindowPrefs(show_filters=False)))
-    win.show_and_focus()
+    win = folded_window(backend, clock)
     click(win, 1, REGION_LABEL)
-    assert win.active_filter is Label.NOTE and win.filters_row.isVisible()
+    assert win.active_filter is Label.NOTE and win.drawer_open and win.filters_row.isVisible()
     win.hide()
+
+
+def test_the_bar_animates_when_animation_is_on(
+    qapp: QApplication, backend: FakeBackend, clock: Clock
+) -> None:
+    from qt_wait import wait_for
+
+    win = SearchWindow(backend, now=clock, start_open=False)
+    win.drawer_animation_ms = 120
     win.show_and_focus()
-    assert not win.filters_row.isVisible()
+    win.handle.click()
+    assert win.drawer.isVisible()  # dropping down
+    assert wait_for(lambda: win.drawer.maximumHeight() == 16777215)
+    win.handle.click()
+    assert wait_for(lambda: not win.drawer.isVisible())
     win.hide()
-    win.deleteLater()
 
 
 # --- Clear all ---
@@ -832,7 +941,7 @@ def test_clear_all_keeps_pinned_items(qapp: QApplication, backend: FakeBackend, 
     win.clear_button.click()
     assert asked == [3]
     assert [row.item_id for row in win.model.rows] == [1]
-    assert not win.clear_button.isEnabled() and not win.clear_action.isEnabled()
+    assert not win.clear_button.isEnabled()
     win.hide()
 
 
@@ -841,7 +950,7 @@ def test_clear_all_only_clears_the_chip_shown(
 ) -> None:
     win, asked = clear_window(backend, clock)
     win.set_filter(Label.LINK)
-    win.clear_action.trigger()
+    win.clear_all()
     assert asked == [1]
     assert sorted(backend.store) == [1, 3, 4]
     win.hide()
@@ -860,3 +969,151 @@ def test_clear_question_gives_only_a_count() -> None:
     assert clear_question(1) == "Delete this item? Pinned items are kept. This cannot be undone."
     assert "3 items" in clear_question(3)
 
+
+
+# --- Pin under "...", 2 x 2 strip, larger buttons (owner's request, 2026-11-26) ---
+
+
+def test_pin_sits_directly_under_the_more_button(qapp: QApplication) -> None:
+    metrics = QFontMetrics(QFont())
+    row = make_row()
+    rects = card_rects(QRect(0, 0, 360, 120), row, metrics, active=True)
+    [(region, pin)] = rects.buttons
+    assert region == REGION_PIN
+    assert pin.left() == rects.menu.left() and pin.top() > rects.menu.bottom()
+    assert rects.card.contains(pin) and not pin.intersects(rects.menu)
+    # A pinned card without buttons draws its pin mark in the same place.
+    quiet = card_rects(QRect(0, 0, 360, 120), make_row(pinned=True), metrics, active=False)
+    assert quiet.pin is not None and quiet.pin.topLeft() == pin.topLeft()
+    # The body keeps clear of the pin column, hovered or not.
+    assert rects.body.right() < pin.left()
+    assert card_rects(QRect(0, 0, 360, 120), row, metrics).body == rects.body
+
+
+def test_a_short_pinnable_card_is_tall_enough_for_the_stacked_buttons(qapp: QApplication) -> None:
+    font = QFont()
+    metrics = QFontMetrics(font)
+    row = make_row()
+    height = card_height(row, font, 360)
+    rects = card_rects(QRect(0, 0, 360, height), row, metrics, active=True)
+    assert rects.card.contains(rects.buttons[0][1]) and rects.card.contains(rects.menu)
+
+
+def test_buttons_are_larger_than_the_badges(qapp: QApplication) -> None:
+    metrics = QFontMetrics(QFont())
+    rects = card_rects(QRect(0, 0, 360, 120), make_row(), metrics, active=True, slide=1.0)
+    assert rects.menu.height() > metrics.height() + 4
+    assert all(icon.height() > metrics.height() + 4 for _r, icon in rects.actions)
+
+
+def test_strip_icons_form_two_rows(qapp: QApplication) -> None:
+    metrics = QFontMetrics(QFont())
+    four = card_rects(QRect(0, 0, 360, 120), make_row(), metrics, active=True, slide=1.0)
+    spots = [icon.topLeft() for _r, icon in four.actions]
+    assert len(four.actions) == 4 and len({p.y() for p in spots}) == 2 and len({p.x() for p in spots}) == 2
+    five = card_rects(
+        QRect(0, 0, 360, 120), make_row(pinned=True, can_name=True), metrics, active=True, slide=1.0
+    )
+    assert len(five.actions) == 5 and len({icon.top() for _r, icon in five.actions}) == 2
+    for _r, icon in five.actions:
+        assert five.strip is not None and five.strip.contains(icon) and five.card.contains(icon)
+
+
+# --- Accessibility pass (owner's request, 2026-11-26) ---
+
+
+def test_cards_have_a_spoken_description_without_secret_text(window: SearchWindow) -> None:
+    from PySide6.QtCore import Qt as _Qt
+
+    for position, entry in enumerate(window.model.entries):
+        spoken = window.model.data(window.model.index(position), _Qt.ItemDataRole.AccessibleTextRole)
+        assert spoken
+        if getattr(entry, "masked", False):
+            assert "text hidden" in spoken and FAKE_SECRET_TEXT not in spoken and "•" not in spoken
+            assert "left" in spoken  # the time left is announced
+    normal = next(r for r in window.model.rows if not r.masked)
+    index = window.model.index(window.model.position_of(normal.item_id))
+    assert normal.preview in window.model.data(index, _Qt.ItemDataRole.AccessibleTextRole)
+
+
+def test_icon_controls_have_names_and_tooltips(window: SearchWindow) -> None:
+    assert window.settings_button.accessibleName() == "Settings"
+    assert "Ctrl+," in window.settings_button.toolTip()
+    assert window.pause_button.accessibleName() in ("Pause capture", "Resume capture")
+    assert window.pause_button.toolTip().startswith(window.pause_button.accessibleName())
+    assert window.handle.accessibleName() and window.search.accessibleName()
+    assert window.list.accessibleName() == "Clipboard items"
+    assert all(chip.accessibleName() for chip in window.chips.values())
+
+
+def test_every_card_action_is_reachable_without_the_mouse(window: SearchWindow) -> None:
+    for keys in ("Ctrl+E", "Ctrl+,", "Ctrl+Shift+P", "Ctrl+D", "Ctrl+P", "Ctrl+R", "Shift+Del", "Ctrl+F"):
+        assert keys in window.shortcuts
+    window.select_item(1)
+    window.shortcuts["Ctrl+E"].activated.emit()
+    assert window.delegate.is_open(1)
+    window.shortcuts["Ctrl+E"].activated.emit()
+    assert not window.delegate.is_open(1)
+
+
+# --- Review? cards can be marked secret too; the shortcuts popup (owner's request, 2026-11-26) ---
+
+
+def test_a_review_card_offers_both_mark_normal_and_mark_secret() -> None:
+    from smartclip.ui.window import REGION_MARK_SECRET, action_regions
+
+    unsure = make_row(state=SecretState.UNSURE, can_pin=False)
+    names = action_regions(unsure, paste=True)
+    assert REGION_MARK in names and REGION_MARK_SECRET in names
+    assert REGION_MARK_SECRET not in action_regions(make_row(), paste=True)
+    assert REGION_MARK_SECRET not in action_regions(make_row(state=SecretState.SECRET, can_pin=False), True)
+    assert card_tooltip(unsure, REGION_MARK) == "Mark normal"
+    assert card_tooltip(unsure, REGION_MARK_SECRET) == "Mark secret"
+
+
+def test_clicking_mark_secret_on_a_review_card_makes_it_secret(window: SearchWindow, backend: FakeBackend) -> None:
+    from smartclip.ui.window import REGION_MARK_SECRET
+
+    review = next(r for r in window.model.rows if r.state is SecretState.UNSURE)
+    window.select_item(review.item_id)
+    window.handle_region(review, REGION_MARK_SECRET)
+    assert backend.store[review.item_id].payload.secret_state is SecretState.SECRET
+
+
+def test_the_hint_bar_is_gone_and_settings_open_the_shortcuts_list(window: SearchWindow) -> None:
+    assert not hasattr(window, "hint_label")
+
+
+def test_shortcuts_list_covers_every_window_shortcut(window: SearchWindow) -> None:
+    from smartclip import config
+    from smartclip.ui.shortcuts_dialog import shortcut_groups
+
+    listed = " | ".join(keys for _g, entries in shortcut_groups() for keys, _w in entries)
+    for keys in window.shortcuts:
+        if keys.startswith("Alt+"):
+            continue  # the numbered ones are listed as a range
+        shown = {"Menu": "Menu key"}.get(keys, keys)
+        assert shown in listed, keys
+    for hotkey in (config.HOTKEY_OPEN_WINDOW, config.HOTKEY_PAUSE, config.HOTKEY_MARK_SECRET, config.HOTKEY_FORCE_SAVE):
+        assert hotkey in listed
+    assert "Alt+1 to Alt+9" in listed and "Enter" in listed and "Esc" in listed
+
+
+def test_shortcuts_dialog_shows_names_and_closes_with_escape(qapp: QApplication) -> None:
+    from PySide6.QtCore import Qt as _Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QLabel
+
+    from smartclip.ui.shortcuts_dialog import ShortcutsDialog
+
+    dialog = ShortcutsDialog(None, active_window=lambda: dialog)
+    dialog.show()
+    names = [label.accessibleName() for label in dialog.findChildren(QLabel) if label.accessibleName()]
+    assert any(name.startswith("Ctrl+P, ") for name in names)
+    QTest.keyClick(dialog, _Qt.Key.Key_Escape)
+    assert not dialog.isVisible()
+
+
+def test_no_possible_secret_chip_beside_the_secret_and_review_chips(window: SearchWindow) -> None:
+    assert Label.POSSIBLE_SECRET not in window.chips
+    assert SecretState.SECRET in window.chips and SecretState.UNSURE in window.chips

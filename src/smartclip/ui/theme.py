@@ -31,14 +31,18 @@ class Theme:
     accent_text: str
     text: str
     muted: str
+    # A little stronger than `muted`, for small text on the tinted cards and the tab bar.
+    muted_strong: str
     input: str
     banner_background: str
     banner_text: str
-    # Status colours, for later items (countdown pill, toasts, Insights).
+    # Status colours, for later items (countdown pill, toasts).
     success: str
     warning: str
     danger: str
-    # Tinted card backgrounds for the planned Insights cards.
+    # Amber text readable on the amber tint (the plain warning colour is too light on it).
+    warning_text: str
+    # Tinted card backgrounds (countdown pill, banners).
     tint1: str
     tint2: str
     tint3: str
@@ -58,6 +62,7 @@ LIGHT = Theme(
     accent_text="#ffffff",
     text="#1b1d2e",
     muted="#6b7089",
+    muted_strong="#575c75",
     input="#ffffff",
     # Danger at 10% over white. The plan's #ebd9dd gave only 4.0:1 with the
     # banner text (calculated in tests/test_theme.py), below 4.5:1.
@@ -66,6 +71,7 @@ LIGHT = Theme(
     success="#14894f",
     warning="#b7791f",
     danger="#c2352b",
+    warning_text="#8f5d0e",
     tint1="#efeafe",
     tint2="#e3f6ee",
     tint3="#fdf0dc",
@@ -85,12 +91,14 @@ DARK = Theme(
     accent_text="#0e1017",
     text="#e8eaf2",
     muted="#8e93aa",
+    muted_strong="#9a9fb5",
     input="#171a25",
     banner_background="#392327",
     banner_text="#ff7a6e",
     success="#3ccf82",
     warning="#e0b04a",
     danger="#ff7a6e",
+    warning_text="#e0b04a",
     tint1="#241f45",
     tint2="#14301f",
     tint3="#392c14",
@@ -117,6 +125,19 @@ def theme_for(scheme: Qt.ColorScheme) -> Theme:
 def current_theme() -> Theme:
     """The theme matching the Windows setting right now."""
     return theme_for(QGuiApplication.styleHints().colorScheme())
+
+
+def pill_colours(theme: Theme, level: str) -> tuple[str | None, str]:
+    """(background, text) colours for the secret countdown pill (UI plan item 7).
+
+    `level` is "normal", "warning" (amber) or "danger" (red); see
+    view_model.countdown_level. The normal pill has no fill, only an outline.
+    """
+    if level == "danger":
+        return theme.banner_background, theme.banner_text
+    if level == "warning":
+        return theme.tint3, theme.warning_text
+    return None, theme.muted
 
 
 def check_icon(theme: Theme) -> str:
@@ -178,6 +199,29 @@ def stylesheet(theme: Theme) -> str:
             font-weight: 600; padding: 4px 10px;
         }}
         #toast QPushButton:hover {{ background: {t.card_hover}; }}
+        QPushButton#handle {{
+            color: {t.muted}; background: transparent; border: none;
+            border-radius: 8px; padding: 0px;
+        }}
+        QPushButton#handle:hover {{ background: {t.card_hover}; color: {t.text}; }}
+        #segment {{ background: {t.border}; border-radius: 12px; }}
+        #segment QPushButton {{
+            background: transparent; color: {t.muted_strong};
+            border: 1px solid transparent; border-radius: 9px; padding: 4px 18px;
+            font-weight: 600;
+        }}
+        /* Qt drops a radius larger than half the button's height, so it stays small. */
+        #segment QPushButton:checked {{
+            background: {t.card}; color: {t.text}; border: 1px solid {t.card}; border-radius: 9px;
+        }}
+        #tint1 {{ background: {t.tint1}; border-radius: {CARD_RADIUS}px; }}
+        #tint2 {{ background: {t.tint2}; border-radius: {CARD_RADIUS}px; }}
+        #tint3 {{ background: {t.tint3}; border-radius: {CARD_RADIUS}px; }}
+        #tint4 {{ background: {t.tint4}; border-radius: {CARD_RADIUS}px; }}
+        #cardTitle {{ color: {t.muted_strong}; font-size: 11px; font-weight: 600; }}
+        #cardValue {{ color: {t.text}; font-size: 20px; font-weight: 700; }}
+        #cardNote {{ color: {t.muted_strong}; font-size: 11px; }}
+        #insightsBody {{ background: transparent; }}
         #settingsBody {{ background: transparent; }}
         QComboBox::drop-down {{ border: none; width: 22px; }}
         QSpinBox::up-button, QSpinBox::down-button {{ width: 0px; border: none; }}
@@ -186,6 +230,7 @@ def stylesheet(theme: Theme) -> str:
             border-radius: {BUTTON_RADIUS}px; padding: 4px 8px; min-height: 22px;
         }}
         QSpinBox:focus, QComboBox:focus, QLineEdit:focus {{ border-color: {t.accent}; }}
+        QPushButton:focus, QCheckBox:focus {{ border: 1px solid {t.accent}; border-radius: {BUTTON_RADIUS}px; }}
         QComboBox QAbstractItemView {{
             background: {t.card}; color: {t.text}; border: 1px solid {t.border};
             selection-background-color: {t.card_selected}; selection-color: {t.text};

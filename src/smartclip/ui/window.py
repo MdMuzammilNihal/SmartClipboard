@@ -17,10 +17,10 @@ Owner's decisions (2026-11-19, second round):
 - The card under the mouse, and the selected card, show buttons next to
   "...": reveal/hide, mark normal and delete on Secret and Review? cards;
   pin/unpin, mark secret and delete on normal cards.
-- The "..." menu has tick boxes to hide the search bar and the filter
-  chips, remembered after a restart (ui/prefs.py). While the search bar is
-  hidden, typing shows it again until the window hides; clicking a badge
-  shows the chips again in the same way.
+- (Replaced 2026-11-25) A slim handle across the top drops down the search
+  box, the filter chips, pause and settings with a short animation. In the
+  app it starts folded; typing, Ctrl+F or choosing a filter opens it, and
+  folding it clears any search or filter so nothing hidden keeps filtering.
 - "Clear all" deletes the cards shown right now (the current chip and
   search), except pinned ones, after one confirmation that gives the count.
 
@@ -65,31 +65,36 @@ SECURITY REVIEW (owner):
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import time
 from typing import Protocol
 
 from PySide6.QtCore import (
     QAbstractListModel,
+    QEasingCurve,
     QEvent,
     QModelIndex,
     QObject,
     QPersistentModelIndex,
+    QPropertyAnimation,
     QPoint,
     QRect,
     QSize,
     Qt,
     QTimer,
+    QVariantAnimation,
     Signal,
 )
 from PySide6.QtGui import (
-    QAction,
     QColor,
     QCursor,
     QFont,
     QFontMetrics,
     QGuiApplication,
     QKeySequence,
+    QLinearGradient,
     QPainter,
+    QPainterPath,
     QPen,
     QShortcut,
     QTextLayout,
@@ -98,15 +103,19 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QInputDialog,
     QLineEdit,
     QListView,
     QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QStackedWidget,
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
@@ -116,13 +125,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from smartclip import config
+from smartclip import naming
 from smartclip.labels import Label, SecretState
 from smartclip.storage import StoredItem
 from smartclip.ui import theme as themes
+from smartclip.ui.confirm import ask_confirm
+
+try:  # Insights is a local-only extra (gitignored): the app runs fine without the file.
+    from smartclip.ui.insights import InsightsView, compute_insights
+except ImportError:  # pragma: no cover - depends on the checkout
+    InsightsView = None  # type: ignore[assignment,misc]
+    compute_insights = None  # type: ignore[assignment]
 from smartclip.ui.notice import Notice
 from smartclip.ui.paste import Paster
-from smartclip.ui.prefs import MemoryPrefs, PrefsStore
 from smartclip.ui.settings_dialog import SettingsPanel
 from smartclip.ui.toast import Toast
 from smartclip.ui.view_model import (
@@ -132,12 +147,16 @@ from smartclip.ui.view_model import (
     Badge,
     Filter,
     Header,
+    Preview,
     RevealState,
     Row,
+    Seg,
+    TagFilter,
     arrange,
     build_rows,
+    countdown_level,
+    countdown_text,
     filter_name,
-    hint_text,
 )
 
 WINDOW_SIZE = QSize(380, 520)
@@ -145,10 +164,13 @@ WINDOW_SIZE = QSize(380, 520)
 ROW_ROLE = Qt.ItemDataRole.UserRole + 1
 # The number shown on the first nine cards (Alt+1 to Alt+9 paste them).
 NUMBER_ROLE = Qt.ItemDataRole.UserRole + 2
+PAGE_HISTORY, PAGE_INSIGHTS = "history", "insights"
 HEADER_HEIGHT = 30  # a day header: room above, then one line of small text
 # Ages are redrawn this often (in seconds) while the window is open.
 _AGE_REFRESH_TICKS = 30
 MAX_BODY_LINES = 3
+MIN_ELIDED_WIDTH = 48  # the long part of a link or path never shrinks below this
+EXPANDED_BODY_LINES = 12  # a long note after "Show more"
 UNDO_TEXT = "Undo"
 PAUSED_TEXT = "Paused: nothing is being saved"
 COPIED_TEXT = "Copied. Press Ctrl+V to paste."
@@ -159,20 +181,36 @@ REVEAL_HINT = "Click to reveal"
 HIDE_HINT = "Click to hide"
 
 # Card geometry, in pixels.
-_OUTER_X, _OUTER_Y, _PAD, _GAP, _BADGE_PAD_X = 8, 4, 10, 6, 7
+# Cards are about 15% taller than the first version (owner's request, 2026-11-25).
+_OUTER_X, _OUTER_Y, _PAD, _GAP, _BADGE_PAD_X = 8, 6, 12, 8, 7
 
 # Icon glyphs from the Windows icon fonts (Windows 11, then Windows 10).
 _ICON_FONTS = ["Segoe Fluent Icons", "Segoe MDL2 Assets"]
 _GLYPH_PAUSE, _GLYPH_PLAY, _GLYPH_MORE, _GLYPH_PIN = "", "", "", ""
 _GLYPH_VIEW, _GLYPH_HIDE, _GLYPH_DELETE = "", "", ""
+_GLYPH_SETTINGS = ""  # the gear
+_GLYPH_DOWN, _GLYPH_UP = "", ""  # the handle's chevrons
+_NO_LIMIT = 16777215  # Qt's "no maximum height"
+_GLYPH_COPY, _GLYPH_PASTE, _GLYPH_EDIT = "\ue8c8", "\ue77f", "\ue70f"
 _GLYPH_LOCK, _GLYPH_UNLOCK = "", ""
 
 # Regions of a card that react to a click.
 REGION_CARD, REGION_LABEL, REGION_STATE, REGION_MENU, REGION_TEXT = (
     "card", "label", "state", "menu", "text",
 )
-# The buttons shown on the card under the mouse or selected.
+# The pin button shown on the card under the mouse or selected.
 REGION_REVEAL, REGION_PIN, REGION_MARK, REGION_DELETE = "reveal", "pin", "mark", "delete"
+REGION_MARK_SECRET = "mark_secret"  # Review? cards only: confirm it IS a secret (REGION_MARK = normal)
+# More icons of the strip that slides in when "..." is pressed.
+REGION_COPY, REGION_PASTE, REGION_EDIT = "copy", "paste", "edit"
+REGION_STRIP = "strip"  # the strip's own background: a click there does nothing
+# The "Show more" / "Show less" link under an expandable preview.
+REGION_EXPAND = "expand"
+# A click on a tag chip on a card; the region text is TAG_PREFIX plus the tag.
+TAG_PREFIX = "tag:"
+MAX_TAG_CHIP = 110  # a tag chip is never wider than this many pixels
+SHOW_MORE, SHOW_LESS = "Show more", "Show less"
+MONO_FAMILIES = ["Cascadia Mono", "Consolas", "Courier New"]
 
 
 class WindowBackend(Protocol):
@@ -183,21 +221,14 @@ class WindowBackend(Protocol):
     def pin(self, item_id: int) -> bool: ...
     def unpin(self, item_id: int) -> bool: ...
     def delete(self, item_id: int) -> bool: ...
+    def rename(self, item_id: int, title: str | None) -> bool: ...
+    def set_tags(self, item_id: int, tags: tuple[str, ...]) -> bool: ...
     def restore(self, items: list[StoredItem]) -> int: ...
     def mark_normal(self, item_id: int) -> bool: ...
     def mark_secret(self, item_id: int) -> bool: ...
     def is_paused(self) -> bool: ...
     def toggle_pause(self) -> bool: ...
     def quit(self) -> None: ...
-
-
-class Switch(Protocol):
-    """An on/off setting shown as a tick-box item in the "..." menu (autostart.py)."""
-
-    label: str
-
-    def is_on(self) -> bool: ...
-    def set_on(self, on: bool) -> bool: ...
 
 
 def _utc_now() -> datetime:
@@ -249,7 +280,27 @@ def _ask(box: QMessageBox) -> bool:
 
 
 def _ask_clear(parent: QWidget, count: int) -> bool:
-    return _ask(question_box(parent, "Clear all", clear_question(count)))
+    return ask_confirm(parent, "Clear all?", clear_question(count), "Delete")
+
+
+NAMING_NOTE_SECRET = "Names and tags are not allowed on secrets"
+NAMING_NOTE_SECRET_TIP = "A title could reveal what the secret is, so secrets cannot have one."
+NAMING_NOTE_PIN = "Pin this item to add a name or tag"
+
+
+def _ask_text(parent: QWidget, title: str, label: str, initial: str, max_length: int) -> str | None:
+    """A one-line text question kept above the always-on-top window. None if cancelled."""
+    dialog = QInputDialog(parent)
+    dialog.setWindowTitle(title)
+    dialog.setLabelText(label)
+    dialog.setTextValue(initial)
+    dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+    dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+    line = dialog.findChild(QLineEdit)
+    if line is not None:
+        line.setMaxLength(max_length)
+    QTimer.singleShot(0, dialog.raise_)
+    return dialog.textValue() if dialog.exec() == QDialog.DialogCode.Accepted else None
 
 
 def place_near(pointer: QPoint, size: QSize, area: QRect, offset: int = 8) -> QPoint:
@@ -308,28 +359,137 @@ class CardRects:
     body: QRect
     text: QRect | None  # the clickable masked or revealed text
     buttons: tuple[tuple[str, QRect], ...] = ()  # (region, rect), left to right
+    expand: QRect | None = None  # the "Show more" link of an expandable preview
+    meta: QRect | None = None  # the line with the owner's title and tag chips
+    tags: tuple[tuple[str, QRect], ...] = ()  # (tag, chip), left to right
+    strip: QRect | None = None  # the sliding action strip, while it is (partly) open
+    actions: tuple[tuple[str, QRect], ...] = ()  # (region, rect) of its icons, left to right
 
 
 def card_buttons(row: Row) -> list[str]:
-    """The buttons an active card shows, left to right, before the "..." button.
+    """The buttons an active card shows before the "..." button: only Pin.
 
-    Secret and Review? cards: reveal/hide, mark normal, delete. Normal cards:
-    pin/unpin, mark secret, delete (sensitive items cannot be pinned).
+    Secret and Review? cards cannot be pinned, so they show "..." alone. The
+    other actions are in the strip that slides in from "...".
     """
+    return [REGION_PIN] if row.can_pin else []
+
+
+def action_regions(row: Row, paste: bool) -> list[str]:
+    """The icons of the sliding strip, left to right (owner's design, 2026-11-25).
+
+    Reveal only for secret and Review? items; Edit (name and tags) only for
+    pinned normal items; Paste only when pasting is available.
+    """
+    names: list[str] = []
     if row.state is not SecretState.NORMAL:
-        return [REGION_REVEAL, REGION_MARK, REGION_DELETE]
-    return [REGION_PIN, REGION_MARK, REGION_DELETE]
+        names.append(REGION_REVEAL)
+    names.append(REGION_COPY)
+    if paste:
+        names.append(REGION_PASTE)
+    names.append(REGION_MARK)
+    if row.state is SecretState.UNSURE:
+        names.append(REGION_MARK_SECRET)  # a Review? card can be settled either way
+    if row.can_name:
+        names.append(REGION_EDIT)
+    names.append(REGION_DELETE)
+    return names
+
+
+ACTION_GAP, ACTION_PAD = 4, 6
+STRIP_ROWS = 2  # the icons sit in a grid of two rows (owner's design, 2026-11-26)
+
+
+def strip_columns(count: int) -> int:
+    """How many columns the grid of `count` icons needs: 2 icons per column."""
+    return max(1, -(-count // STRIP_ROWS))
+
+
+def strip_width(columns: int, size: int) -> int:
+    """The width of the fully open strip for `columns` columns of `size`-pixel icons."""
+    return ACTION_PAD + columns * (size + ACTION_GAP) + ACTION_PAD - ACTION_GAP
+
+
+def button_size(metrics: QFontMetrics) -> int:
+    """The side of the "..." and Pin buttons (a little larger than the badges, 2026-11-26)."""
+    return metrics.height() + 8
+
+
+def pin_column(row: Row, metrics: QFontMetrics) -> int:
+    """Width kept free at the right of the body for the Pin button under "...".
+
+    Kept for every card that can be pinned or is pinned, hovered or not, so the
+    text does not re-wrap when the mouse moves over a card.
+    """
+    return button_size(metrics) + 6 if (row.can_pin or row.pinned) else 0
+
+
+MIN_SOURCE_WIDTH = 36  # the top row keeps at least this much for the source app
+
+
+def top_row_extras(
+    row: Row, number: object, active: bool, metrics: QFontMetrics, room: int
+) -> tuple[str | None, bool]:
+    """What fits in the top row besides the source app: (pill text, show key-cap).
+
+    The countdown pill matters more than the quick-paste key-cap. When space
+    is short the pill loses its word "left", then the key-cap goes. An active
+    card shows buttons instead of the key-cap but keeps its pill, so a secret
+    just marked (still selected) visibly starts its countdown. `room` is the
+    width left after the age.
+    """
+    if active:
+        number = None
+    cap = metrics.height() + 8 if number is not None else 0  # same as the key-cap drawn below
+
+    def fits(pill: str | None, key_cap: int) -> bool:
+        pill_room = metrics.horizontalAdvance(pill) + 14 + 6 if pill else 0
+        return room - pill_room - key_cap >= MIN_SOURCE_WIDTH
+
+    if row.remaining is None:
+        return None, number is not None and fits(None, cap)
+    full = countdown_text(row.remaining)
+    short = full.removesuffix(" left")
+    for pill, key_cap in ((full, cap), (short, cap), (short, 0)):
+        if fits(pill, key_cap):
+            return pill, key_cap > 0
+    return short, False
 
 
 def _badge_width(badge: Badge, metrics: QFontMetrics) -> int:
     return metrics.horizontalAdvance(badge.text) + 2 * _BADGE_PAD_X
 
 
-def card_rects(rect: QRect, row: Row, metrics: QFontMetrics, active: bool = False) -> CardRects:
+def has_meta(row: Row) -> bool:
+    """True if the card shows a line for the owner's title and tags."""
+    return not row.masked and bool(row.title or row.tags)
+
+
+def tag_chip_rects(row: Row, metrics: QFontMetrics, meta: QRect) -> tuple[tuple[str, QRect], ...]:
+    """Where each tag chip goes: right-aligned on the meta line, the title keeps room to its left."""
+    chips: list[tuple[str, int]] = []
+    for tag in row.tags:
+        chips.append((tag, min(MAX_TAG_CHIP, metrics.horizontalAdvance(tag) + 16)))
+    min_title = 60 if row.title else 0
+    while chips and meta.width() - sum(w + 6 for _t, w in chips) < min_title:
+        chips.pop()  # too many chips for this width: drop the last ones
+    x = meta.right() + 1 - sum(w + 6 for _t, w in chips) + 6
+    placed: list[tuple[str, QRect]] = []
+    for tag, width in chips:
+        placed.append((tag, QRect(x, meta.top(), width, meta.height())))
+        x += width + 6
+    return tuple(placed)
+
+
+def card_rects(
+    rect: QRect, row: Row, metrics: QFontMetrics, active: bool = False,
+    slide: float = 0.0, paste: bool = True,
+) -> CardRects:
     """Lay out one card inside the list cell `rect`.
 
-    `active` (the card under the mouse, or the selected one) adds the card
-    buttons; the source app and age then get less room.
+    `active` (the card under the mouse, or the selected one) adds the Pin
+    button; the source app and age then get less room. `slide` (0 to 1) is
+    how far the action strip has slid in from the right over the card.
     """
     card = rect.adjusted(_OUTER_X, _OUTER_Y, -_OUTER_X, -_OUTER_Y)
     inner = card.adjusted(_PAD, _PAD, -_PAD, -_PAD)
@@ -345,18 +505,19 @@ def card_rects(rect: QRect, row: Row, metrics: QFontMetrics, active: bool = Fals
             right_of_badges + 5, inner.top(), _badge_width(row.state_badge, metrics), badge_height
         )
         right_of_badges = state.right()
-    menu = QRect(inner.right() - badge_height + 1, inner.top(), badge_height, badge_height)
+    side = button_size(metrics)
+    # "..." is centred on the badge row; Pin sits directly below it.
+    menu = QRect(inner.right() - side + 1, inner.top() - (side - badge_height) // 2, side, side)
     pin = None
     buttons: list[tuple[str, QRect]] = []
-    right_edge = menu.left() - 2
+    below = QRect(menu.left(), menu.bottom() + 3, side, side)
     if active:
-        for region in reversed(card_buttons(row)):
-            button = QRect(right_edge - badge_height, inner.top(), badge_height, badge_height)
-            buttons.insert(0, (region, button))
-            right_edge = button.left() - 2
+        for region in card_buttons(row):
+            buttons.append((region, QRect(below)))
+            below.translate(0, side + 2)
     elif row.pinned:
-        pin = QRect(menu.left() - badge_height - 2, inner.top(), badge_height, badge_height)
-        right_edge = pin.left() - 2
+        pin = below
+    right_edge = menu.left() - 2
     top_text = QRect(
         right_of_badges + 8, inner.top(), max(0, right_edge - right_of_badges - 8), badge_height
     )
@@ -365,14 +526,49 @@ def card_rects(rect: QRect, row: Row, metrics: QFontMetrics, active: bool = Fals
         inner.top() + badge_height + _GAP,
         inner.width(),
         max(0, inner.bottom() - inner.top() - badge_height - _GAP + 1),
-    )
+    ).adjusted(0, 0, -pin_column(row, metrics), 0)
+    meta = None
+    tag_rects: tuple[tuple[str, QRect], ...] = ()
+    if has_meta(row):
+        # The owner's title and tag chips take a line of their own above the body.
+        line = metrics.lineSpacing()
+        meta = QRect(body.left(), body.top(), body.width(), line)
+        tag_rects = tag_chip_rects(row, metrics, meta)
+        body = QRect(body.left(), body.top() + line + _GAP, body.width(), max(0, body.height() - line - _GAP))
     text = None
+    expand = None
     if row.masked:
         hint_width = metrics.horizontalAdvance(f"{row.preview}   {REVEAL_HINT}")
         text = QRect(body.left(), body.top(), min(hint_width, body.width()), metrics.lineSpacing())
     elif row.revealed:
         text = body
-    return CardRects(card, label, state, menu, pin, top_text, body, text, tuple(buttons))
+    elif row.rich is not None and row.rich.expandable:
+        # The toggle takes the last line of the body, under the preview.
+        line = metrics.lineSpacing()
+        link = SHOW_LESS if row.rich.expanded else SHOW_MORE
+        expand = QRect(
+            body.left(), body.bottom() - line + 1, metrics.horizontalAdvance(link) + 4, line
+        )
+        body = QRect(body.left(), body.top(), body.width(), max(0, body.height() - line))
+    strip = None
+    icons: list[tuple[str, QRect]] = []
+    if slide > 0:
+        size = side + 2
+        regions = action_regions(row, paste)
+        columns = strip_columns(len(regions))
+        width = round(strip_width(columns, size) * min(1.0, slide))
+        strip = QRect(card.right() + 1 - width, card.top(), width, card.height())
+        grid_height = STRIP_ROWS * size + (STRIP_ROWS - 1) * ACTION_GAP
+        top = card.top() + (card.height() - grid_height) // 2
+        for index, region in enumerate(regions):
+            line, column = divmod(index, columns)
+            x = strip.left() + ACTION_PAD + column * (size + ACTION_GAP)
+            y = top + line * (size + ACTION_GAP)
+            icons.append((region, QRect(x, y, size, size)))
+    return CardRects(
+        card, label, state, menu, pin, top_text, body, text, tuple(buttons), expand, meta,
+        tag_rects, strip, tuple(icons),
+    )
 
 
 def show_label_badge(row: Row) -> bool:
@@ -382,11 +578,21 @@ def show_label_badge(row: Row) -> bool:
 
 def region_at(rects: CardRects, point: QPoint) -> str:
     """Which part of a card a click at `point` landed on."""
+    if rects.strip is not None and rects.strip.contains(point):
+        for region, icon in rects.actions:
+            if icon.contains(point):
+                return region
+        return REGION_STRIP  # covers whatever lies under the strip
     if rects.menu.contains(point):
         return REGION_MENU
     for region, button in rects.buttons:
         if button.contains(point):
             return region
+    for tag, chip in rects.tags:
+        if chip.contains(point):
+            return TAG_PREFIX + tag
+    if rects.expand is not None and rects.expand.contains(point):
+        return REGION_EXPAND
     if rects.label is not None and rects.label.contains(point):
         return REGION_LABEL
     if rects.state is not None and rects.state.contains(point):
@@ -396,13 +602,96 @@ def region_at(rects: CardRects, point: QPoint) -> str:
     return REGION_CARD
 
 
+def fit_segments(segments: tuple[Seg, ...], fonts: list[QFont], room: int) -> list[int]:
+    """The width each piece of a line gets, so that the line fits in `room` pixels.
+
+    Pieces keep their natural width when everything fits. Otherwise the
+    first piece marked "middle" (the folder of a path, the tail of a link)
+    shrinks first, down to a small minimum; whatever is still too wide is
+    taken from the last piece. A bold file name therefore survives a long folder.
+    """
+    natural = [QFontMetrics(font).horizontalAdvance(seg.text) + 2 for seg, font in zip(segments, fonts)]
+    excess = sum(natural) - room
+    widths = list(natural)
+    if excess > 0:
+        for index, seg in enumerate(segments):
+            if seg.elide == "middle":
+                shrunk = max(MIN_ELIDED_WIDTH, widths[index] - excess)
+                excess -= widths[index] - shrunk
+                widths[index] = shrunk
+                break
+    if excess > 0 and widths:
+        widths[-1] = max(0, widths[-1] - excess)
+    return widths
+
+
+def mono_font(base: QFont) -> QFont:
+    """The code font for previews, one pixel smaller than the text font."""
+    font = QFont(base)
+    font.setFamilies(MONO_FAMILIES)
+    font.setStyleHint(QFont.StyleHint.Monospace)
+    if base.pixelSize() > 0:
+        font.setPixelSize(max(8, base.pixelSize() - 1))
+    return font
+
+
+def body_line_count(row: Row, font: QFont, width: int) -> int:
+    """How many lines the body of this card takes at this width (not counting "Show more")."""
+    if row.masked:
+        return 1
+    rich = row.rich
+    if rich is None:
+        return len(wrap_lines(row.preview, font, width, MAX_BODY_LINES))
+    if rich.wrap:
+        limit = EXPANDED_BODY_LINES if rich.expanded else MAX_BODY_LINES
+        return len(wrap_lines(rich.lines[0][0].text, font, width, limit))
+    return len(rich.lines)
+
+
 def card_height(row: Row, font: QFont, width: int) -> int:
     """The height of one list cell holding this row's card."""
     metrics = QFontMetrics(font)
-    body_width = width - 2 * _OUTER_X - 2 * _PAD
-    lines = 1 if row.masked else len(wrap_lines(row.preview, font, body_width, MAX_BODY_LINES))
+    body_width = width - 2 * _OUTER_X - 2 * _PAD - pin_column(row, metrics)
+    lines = body_line_count(row, font, body_width)
+    if not row.masked and row.rich is not None and row.rich.expandable:
+        lines += 1  # the "Show more" link
     badge_height = metrics.height() + 4
-    return 2 * _OUTER_Y + 2 * _PAD + badge_height + _GAP + lines * metrics.lineSpacing()
+    meta = metrics.lineSpacing() + _GAP if has_meta(row) else 0
+    height = 2 * _OUTER_Y + 2 * _PAD + badge_height + _GAP + meta + lines * metrics.lineSpacing()
+    if pin_column(row, metrics):  # room for "..." with Pin stacked under it
+        height = max(height, 2 * _OUTER_Y + 2 * _PAD + 2 * button_size(metrics) + 2)
+    return height
+
+
+class EdgeFade(QWidget):
+    """A soft fade over one edge of the filter chips, shown when chips are cut off there.
+
+    It is drawn in the window colour, ignores the mouse, and is only shown
+    while there is more to scroll to on its side (UI plan item 8, chip row).
+    """
+
+    WIDTH = 28
+
+    def __init__(self, parent: QWidget, right: bool) -> None:
+        super().__init__(parent)
+        self._right = right
+        self._colour = QColor("#ffffff")
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setFixedWidth(self.WIDTH)
+        self.hide()
+
+    def set_colour(self, colour: str) -> None:
+        self._colour = QColor(colour)
+        self.update()
+
+    def paintEvent(self, event: QEvent) -> None:  # noqa: N802 (Qt name)
+        painter = QPainter(self)
+        solid, clear = QColor(self._colour), QColor(self._colour)
+        clear.setAlpha(0)
+        gradient = QLinearGradient(0, 0, self.width(), 0)
+        gradient.setColorAt(0.0, clear if self._right else solid)
+        gradient.setColorAt(1.0, solid if self._right else clear)
+        painter.fillRect(self.rect(), gradient)
 
 
 class CardsModel(QAbstractListModel):
@@ -474,7 +763,9 @@ class CardsModel(QAbstractListModel):
             return entry
         if role == NUMBER_ROLE:
             return self._numbers.get(index.row())
-        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.AccessibleTextRole):
+        if role == Qt.ItemDataRole.AccessibleTextRole:
+            return entry.text if isinstance(entry, Header) else card_accessible_text(entry)
+        if role == Qt.ItemDataRole.DisplayRole:
             # Headers show their fixed word. For cards: the bullet mask for
             # masked rows; the text itself never leaves here.
             return entry.text if isinstance(entry, Header) else entry.preview
@@ -492,6 +783,74 @@ class CardDelegate(QStyledItemDelegate):
         self.theme = themes.LIGHT
         self.icon_font = QFont()
         self.icon_font.setFamilies(_ICON_FONTS)
+        self.icon_font.setPixelSize(16)  # a little larger than before (2026-11-26)
+        self.paste_enabled = True  # the window turns it off when it cannot paste
+        self.animation_ms = 170  # tests set 0 so the strip jumps instead of sliding
+        self._slides: dict[int, float] = {}
+        self._actions_item: int | None = None
+        self._opening = False
+        self._animation = QVariantAnimation(self)
+        self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._animation.valueChanged.connect(self._on_slide)
+        self._animation.finished.connect(self._on_slide_finished)
+
+    # --- The sliding action strip (one card at a time) ---
+
+    @property
+    def actions_item(self) -> int | None:
+        """The item whose strip is open or sliding, or None."""
+        return self._actions_item
+
+    def is_open(self, item_id: int) -> bool:
+        return self._actions_item == item_id and self._opening
+
+    def slide_for(self, item_id: int) -> float:
+        return self._slides.get(item_id, 0.0)
+
+    def open_actions(self, item_id: int) -> None:
+        if self._actions_item not in (None, item_id):
+            self._slides.pop(self._actions_item, None)
+        self._actions_item, self._opening = item_id, True
+        self._run(self.slide_for(item_id), 1.0)
+
+    def close_actions(self, animate: bool = True) -> None:
+        item = self._actions_item
+        if item is None:
+            return
+        self._opening = False
+        if animate and self.animation_ms > 0:
+            self._run(self.slide_for(item), 0.0)
+        else:
+            self._animation.stop()
+            self._slides.pop(item, None)
+            self._actions_item = None
+            self._view.viewport().update()
+
+    def _run(self, start: float, end: float) -> None:
+        self._animation.stop()
+        if self.animation_ms <= 0:
+            self._set_slide(end)
+            self._on_slide_finished()
+            return
+        self._animation.setDuration(self.animation_ms)
+        self._animation.setStartValue(float(start))
+        self._animation.setEndValue(float(end))
+        self._animation.start()
+
+    def _set_slide(self, value: object) -> None:
+        if self._actions_item is not None:
+            self._slides[self._actions_item] = float(value)  # type: ignore[arg-type]
+            self._view.viewport().update()
+
+    def _on_slide(self, value: object) -> None:
+        self._set_slide(value)
+
+    def _on_slide_finished(self) -> None:
+        item = self._actions_item
+        if item is not None and not self._opening and self.slide_for(item) <= 0.0:
+            self._slides.pop(item, None)
+            self._actions_item = None
+        self._view.viewport().update()
 
     def sizeHint(  # noqa: N802 (Qt name)
         self, option: QStyleOptionViewItem, index: QModelIndex | QPersistentModelIndex
@@ -520,7 +879,10 @@ class CardDelegate(QStyledItemDelegate):
         metrics = option.fontMetrics
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
-        rects = card_rects(option.rect, row, metrics, active=selected or hovered)
+        slide = self.slide_for(row.item_id)
+        rects = card_rects(
+            option.rect, row, metrics, active=selected or hovered, slide=slide, paste=self.paste_enabled
+        )
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
@@ -538,16 +900,34 @@ class CardDelegate(QStyledItemDelegate):
         painter.setPen(QColor(t.muted))
         age_width = metrics.horizontalAdvance(row.age) + 4
         number = index.data(NUMBER_ROLE)
-        # The quick-paste number is drawn as a small key-cap left of the age;
-        # the buttons take that place while the card is active.
-        numbered = number is not None and not rects.buttons
         keycap_size = rects.top_text.height() - 4
+        pill_text, numbered = top_row_extras(
+            row, number, bool(rects.buttons), metrics, rects.top_text.width() - age_width
+        )
         number_width = keycap_size + 8 if numbered else 0
-        source_rect = rects.top_text.adjusted(0, 0, -(age_width + number_width), 0)
+        pill_width = metrics.horizontalAdvance(pill_text) + 14 if pill_text else 0
+        pill_gap = 6 if pill_text else 0
+        source_rect = rects.top_text.adjusted(
+            0, 0, -(age_width + number_width + pill_width + pill_gap), 0
+        )
         source = metrics.elidedText(row.source_app, Qt.TextElideMode.ElideRight, source_rect.width())
         align = Qt.AlignmentFlag.AlignVCenter
         painter.drawText(source_rect, align | Qt.AlignmentFlag.AlignLeft, source)
         painter.drawText(rects.top_text, align | Qt.AlignmentFlag.AlignRight, row.age)
+        if pill_text and row.remaining is not None:
+            pill = QRect(
+                rects.top_text.right() - age_width - number_width - pill_width,
+                rects.top_text.top() + 2,
+                pill_width,
+                keycap_size,
+            )
+            fill, ink = themes.pill_colours(t, countdown_level(row.remaining))
+            painter.setPen(QPen(QColor(fill or t.border), 1))
+            painter.setBrush(QColor(fill) if fill else Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(pill, pill.height() / 2, pill.height() / 2)
+            painter.setPen(QColor(ink))
+            painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, pill_text)
+            painter.setPen(QColor(t.muted))
         if numbered:
             keycap = QRect(
                 rects.top_text.right() - age_width - keycap_size - 4,
@@ -577,6 +957,8 @@ class CardDelegate(QStyledItemDelegate):
         painter.drawText(rects.menu, center, _GLYPH_MORE)
         painter.setFont(option.font)
 
+        if rects.meta is not None:
+            self._paint_meta(painter, option, row, rects)
         top_left = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
         if row.masked:
             painter.setPen(QColor(t.text))
@@ -584,6 +966,8 @@ class CardDelegate(QStyledItemDelegate):
             painter.setPen(QColor(t.muted))
             hint_x = metrics.horizontalAdvance(row.preview + "   ")
             painter.drawText(rects.body.adjusted(hint_x, 0, 0, 0), top_left, REVEAL_HINT)
+        elif row.rich is not None:
+            self._paint_preview(painter, option, row, rects)
         else:
             painter.setPen(QColor(t.text))
             lines = wrap_lines(row.preview, option.font, rects.body.width(), MAX_BODY_LINES)
@@ -592,7 +976,154 @@ class CardDelegate(QStyledItemDelegate):
                 line_rect = QRect(rects.body.left(), y, rects.body.width(), metrics.lineSpacing())
                 painter.drawText(line_rect, top_left, line)
                 y += metrics.lineSpacing()
+        if rects.strip is not None:
+            self._paint_strip(painter, row, rects, slide, selected)
         painter.restore()
+
+    def _paint_strip(
+        self, painter: QPainter, row: Row, rects: CardRects, slide: float, selected: bool
+    ) -> None:
+        """The action icons sliding in over the right side of the card."""
+        t = self.theme
+        radius = themes.CARD_RADIUS
+        path = QPainterPath()
+        path.addRoundedRect(rects.card.adjusted(0, 0, -1, -1), radius, radius)
+        painter.setClipPath(path)
+        strip = rects.strip
+        if strip is None:
+            return
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(t.card_selected if selected else t.card_hover))
+        painter.drawRect(strip.adjusted(0, -1, 2, 1))
+        painter.setPen(QPen(QColor(t.border), 1))  # a thin divider on its left edge only
+        painter.drawLine(strip.left(), strip.top() + 6, strip.left(), strip.bottom() - 6)
+        painter.setFont(self.icon_font)
+        painter.setOpacity(min(1.0, slide * 1.6))
+        for region, icon in rects.actions:
+            glyph, on = button_glyph(row, region)
+            ink = t.danger if region == REGION_DELETE else t.accent if on else t.text
+            painter.setPen(QColor(ink))
+            painter.drawText(icon, Qt.AlignmentFlag.AlignCenter, glyph)
+        painter.setOpacity(1.0)
+
+    def _paint_meta(
+        self, painter: QPainter, option: QStyleOptionViewItem, row: Row, rects: CardRects
+    ) -> None:
+        """The owner's title (bold) and tag chips above the text (UI plan item 9)."""
+        t = self.theme
+        meta = rects.meta
+        if meta is None:
+            return
+        if row.title:
+            title_font = QFont(option.font)
+            title_font.setWeight(QFont.Weight.DemiBold)
+            right = rects.tags[0][1].left() - 8 if rects.tags else meta.right()
+            room = max(0, right - meta.left() + 1)
+            painter.setFont(title_font)
+            painter.setPen(QColor(t.text))
+            shown = QFontMetrics(title_font).elidedText(row.title, Qt.TextElideMode.ElideRight, room)
+            painter.drawText(
+                QRect(meta.left(), meta.top(), room, meta.height()),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                shown,
+            )
+            painter.setFont(option.font)
+        # Chips are card-coloured with an outline, so they show on a selected card too,
+        # and the accent text on them keeps at least 4.5:1 contrast (tests/test_theme.py).
+        for tag, chip in rects.tags:
+            painter.setBrush(QColor(t.card))
+            painter.setPen(QPen(QColor(t.border), 1))
+            painter.drawRoundedRect(chip, chip.height() / 2, chip.height() / 2)
+            painter.setPen(QColor(t.accent))
+            text = QFontMetrics(option.font).elidedText(tag, Qt.TextElideMode.ElideRight, chip.width() - 12)
+            painter.drawText(chip, Qt.AlignmentFlag.AlignCenter, text)
+        painter.setPen(QColor(t.muted))
+
+    def _paint_preview(
+        self, painter: QPainter, option: QStyleOptionViewItem, row: Row, rects: CardRects
+    ) -> None:
+        """Draw the body of a normal card by its Preview (UI plan item 8)."""
+        t = self.theme
+        rich = row.rich
+        if rich is None:
+            return
+        metrics = option.fontMetrics
+        line_height = metrics.lineSpacing()
+        body = rects.body
+        top_left = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        if rich.wrap:
+            limit = EXPANDED_BODY_LINES if rich.expanded else MAX_BODY_LINES
+            painter.setPen(QColor(t.text))
+            y = body.top()
+            for line in wrap_lines(rich.lines[0][0].text, option.font, body.width(), limit):
+                painter.drawText(QRect(body.left(), y, body.width(), line_height), top_left, line)
+                y += line_height
+        else:
+            y = body.top()
+            for segments in rich.lines:
+                self._paint_line(
+                    painter, option.font, segments, rich, QRect(body.left(), y, body.width(), line_height)
+                )
+                y += line_height
+        if rects.expand is not None:
+            painter.setFont(option.font)
+            painter.setPen(QColor(t.accent))
+            link = SHOW_LESS if rich.expanded else SHOW_MORE
+            painter.drawText(rects.expand, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, link)
+
+    def _paint_line(
+        self, painter: QPainter, base: QFont, segments: tuple[Seg, ...], rich: Preview, rect: QRect
+    ) -> None:
+        """One preview line: an optional swatch, its pieces cut to fit, an optional chip."""
+        t = self.theme
+        left, right = rect.left(), rect.right()
+        if rich.swatch:
+            size = min(rect.height() - 4, 14)
+            swatch = QRect(left, rect.top() + (rect.height() - size) // 2, size, size)
+            painter.setPen(QPen(QColor(t.border), 1))
+            painter.setBrush(QColor(rich.swatch))
+            painter.drawRoundedRect(swatch, 3, 3)
+            left = swatch.right() + 8
+        chip_rect = None
+        if rich.chip:
+            chip_font = QFont(base)
+            chip_font.setPixelSize(11)
+            chip_width = QFontMetrics(chip_font).horizontalAdvance(rich.chip) + 12
+            chip_rect = QRect(right - chip_width + 1, rect.top() + 2, chip_width, rect.height() - 4)
+            right = chip_rect.left() - 6
+        fonts = [self._segment_font(base, seg) for seg in segments]
+        widths = fit_segments(segments, fonts, max(0, right - left + 1))
+        x = left
+        for seg, font, width in zip(segments, fonts, widths):
+            painter.setFont(font)
+            painter.setPen(QColor(t.muted if seg.style == "muted" else t.text))
+            mode = Qt.TextElideMode.ElideMiddle if seg.elide == "middle" else Qt.TextElideMode.ElideRight
+            text = QFontMetrics(font).elidedText(seg.text, mode, width)
+            painter.drawText(
+                QRect(x, rect.top(), width, rect.height()),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                text,
+            )
+            x += width
+        if chip_rect is not None and rich.chip:
+            chip_font = QFont(base)
+            chip_font.setPixelSize(11)
+            painter.setFont(chip_font)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(t.border), 1))
+            painter.drawRoundedRect(chip_rect, chip_rect.height() / 2, chip_rect.height() / 2)
+            painter.setPen(QColor(t.muted))
+            painter.drawText(chip_rect, Qt.AlignmentFlag.AlignCenter, rich.chip)
+        painter.setFont(base)
+
+    @staticmethod
+    def _segment_font(base: QFont, seg: Seg) -> QFont:
+        if seg.style == "mono":
+            return mono_font(base)
+        font = QFont(base)
+        if seg.style == "bold":
+            font.setWeight(QFont.Weight.DemiBold)
+        return font
 
     def _paint_header(self, painter: QPainter, option: QStyleOptionViewItem, header: Header) -> None:
         """A small muted capitals label, like the dashboard's "MENU" (UI plan item 2)."""
@@ -630,7 +1161,10 @@ class CardDelegate(QStyledItemDelegate):
             if isinstance(row, Row):
                 point = event.position().toPoint()  # type: ignore[attr-defined]
                 # A click lands on the card under the mouse, which shows its buttons.
-                rects = card_rects(option.rect, row, option.fontMetrics, active=True)
+                rects = card_rects(
+                    option.rect, row, option.fontMetrics, active=True,
+                    slide=self.slide_for(row.item_id), paste=self.paste_enabled,
+                )
                 region = region_at(rects, point)
                 self.region_clicked.emit(
                     index.row(), region, self._view.viewport().mapToGlobal(point)
@@ -646,13 +1180,37 @@ class CardDelegate(QStyledItemDelegate):
         if not isinstance(row, Row):
             return False
         point = event.pos()  # type: ignore[attr-defined]
-        rects = card_rects(option.rect, row, option.fontMetrics, active=True)
+        rects = card_rects(
+            option.rect, row, option.fontMetrics, active=True,
+            slide=self.slide_for(row.item_id), paste=self.paste_enabled,
+        )
         tip = card_tooltip(row, region_at(rects, point))
         if tip:
             QToolTip.showText(event.globalPos(), tip, view)  # type: ignore[attr-defined]
         else:
             QToolTip.hideText()
         return True
+
+
+def card_accessible_text(row: Row) -> str:
+    """What a screen reader says for one card (owner's accessibility pass, 2026-11-26).
+
+    Type, state, the text, source app, age, and the time left for a secret.
+    A masked secret is announced as "hidden", never as its text or its mask;
+    a revealed one reads out the text the window is showing at that moment.
+    """
+    parts = [row.label_badge.text if show_label_badge(row) else ""]
+    if row.state_badge is not None:
+        parts.append(row.state_badge.text)
+    if row.title and not row.masked:
+        parts.append(row.title)
+    parts.append("text hidden" if row.masked else row.preview[:200])
+    if row.pinned:
+        parts.append("pinned")
+    parts += [f"from {row.source_app}" if row.source_app else "", row.age]
+    if row.remaining is not None:
+        parts.append(countdown_text(row.remaining))
+    return ", ".join(part for part in parts if part)
 
 
 def card_tooltip(row: Row, region: str) -> str:
@@ -665,12 +1223,24 @@ def card_tooltip(row: Row, region: str) -> str:
         return "More actions"
     if region == REGION_TEXT:
         return HIDE_HINT if row.revealed else "Click to reveal for 10 seconds"
+    if region.startswith(TAG_PREFIX):
+        return f"Show only items tagged {region[len(TAG_PREFIX):]}"
+    if region == REGION_EXPAND:
+        return "Show less" if row.rich is not None and row.rich.expanded else "Show the whole item"
     if region == REGION_REVEAL:
         return "Hide" if row.revealed else "Reveal for 10 seconds"
+    if region == REGION_COPY:
+        return "Copy only"
+    if region == REGION_PASTE:
+        return "Paste into the previous app"
+    if region == REGION_EDIT:
+        return "Name and tags"
     if region == REGION_PIN:
         return "Unpin" if row.pinned else "Pin (kept until unpinned)"
     if region == REGION_MARK:
         return "Mark secret" if row.state is SecretState.NORMAL else "Mark normal"
+    if region == REGION_MARK_SECRET:
+        return "Mark secret"
     if region == REGION_DELETE:
         return "Delete"
     return ""
@@ -682,9 +1252,17 @@ def button_glyph(row: Row, region: str) -> tuple[str, bool]:
         return (_GLYPH_HIDE, True) if row.revealed else (_GLYPH_VIEW, False)
     if region == REGION_PIN:
         return _GLYPH_PIN, row.pinned
+    if region == REGION_MARK_SECRET:
+        return _GLYPH_LOCK, False
     if region == REGION_MARK:
         # The lock marks secret; the open lock marks a Secret/Review? item normal.
         return (_GLYPH_LOCK, False) if row.state is SecretState.NORMAL else (_GLYPH_UNLOCK, False)
+    if region == REGION_COPY:
+        return _GLYPH_COPY, False
+    if region == REGION_PASTE:
+        return _GLYPH_PASTE, False
+    if region == REGION_EDIT:
+        return _GLYPH_EDIT, False
     return _GLYPH_DELETE, False
 
 
@@ -693,7 +1271,14 @@ def present_filters(items: list[StoredItem]) -> list[Filter]:
     states = {item.payload.secret_state for item in items}
     labels = {item.payload.label for item in items}
     found: list[Filter] = [state for state in STATE_BADGES if state in states]
-    found += [label for label in LABEL_BADGES if label in labels]
+    # No chip for the "possible secret" type: every such item has a Secret or
+    # Review? state, and those chips already list them (owner's report, 2026-11-26).
+    found += [label for label in LABEL_BADGES if label in labels and label is not Label.POSSIBLE_SECRET]
+    seen: dict[str, str] = {}
+    for item in items:
+        for tag in item.payload.tags:
+            seen.setdefault(naming.tag_key(tag), tag)
+    found += [TagFilter(seen[key]) for key in sorted(seen)]  # tag chips come after the type chips
     return found
 
 
@@ -708,30 +1293,28 @@ class SearchWindow(QWidget):
         active_window: Callable[[], QWidget | None] = QApplication.activeWindow,
         paster: Paster | None = None,
         current_theme: Callable[[], themes.Theme] = themes.current_theme,
-        switches: list[Switch] | None = None,
-        prefs: PrefsStore | None = None,
+        start_open: bool = True,
         confirm_clear: Callable[[QWidget, int], bool] = _ask_clear,
         settings_panel_factory: Callable[[QWidget], SettingsPanel] | None = None,
-        show_hints: bool = True,
         undo_ms: int = 5000,
-        pause_keys: str = config.HOTKEY_PAUSE,
+        ask_text: Callable[[QWidget, str, str, str, int], str | None] = _ask_text,
     ) -> None:
         super().__init__()
         self._backend = backend
-        self._prefs_store = prefs or MemoryPrefs()
-        self.prefs = self._prefs_store.load()
+        # The top bar (search, filters, pause, settings): folded or open when the
+        # window opens. The app passes False; tests default to open.
+        self._start_open = start_open
+        self._drawer_open = start_open
+        self.drawer_animation_ms = 180  # tests set 0 so the bar jumps
+        self._drawer_anim: QPropertyAnimation | None = None
         self._confirm_clear = confirm_clear
-        self._pause_keys = pause_keys
+        self._ask_text = ask_text
         self._notice: Notice | None = None
-        self._show_hints = show_hints
         # Built with this window as its parent, so it uses the same style sheet.
         self.settings_panel = settings_panel_factory(self) if settings_panel_factory else None
         if self.settings_panel is not None:
             # The panel hides itself when another app takes the focus; so do we.
             self.settings_panel.focus_left.connect(self.hide_if_focus_left)
-        # Shown for this opening only although hidden in prefs (typing, badge click).
-        self._search_shown_for_now = False
-        self._filters_shown_for_now = False
         self._now = now
         self.reveals = reveals or RevealState()
         self._active_window = active_window
@@ -742,7 +1325,14 @@ class SearchWindow(QWidget):
         self._filter: Filter | None = None
         self._chip_filters: list[Filter] = []
         self._ticks = 0
+        # Countdown bookkeeping: the earliest secret expiry on screen, and the
+        # smallest time-left shown so far for each item (it never goes up).
+        self._next_expiry: datetime | None = None
+        self._remaining_seen: dict[int, timedelta] = {}
+        # Items whose "Show more" is open; forgotten when the window hides.
+        self._expanded: set[int] = set()
         self._corners_rounded = False
+        self._panel_opened_at = float("-inf")
 
         self.setWindowTitle("Smart Clipboard")
         self.setWindowFlags(
@@ -757,8 +1347,10 @@ class SearchWindow(QWidget):
         self.search = QLineEdit()
         self.search.setObjectName("search")
         self.search.setPlaceholderText("Search")
+        self.search.setAccessibleName("Search clipboard history")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self.refresh)
+        self.search.textChanged.connect(lambda _text: self._back_to_history())
         self.search.installEventFilter(self)
 
         icon_font = QFont()
@@ -766,41 +1358,18 @@ class SearchWindow(QWidget):
         self.pause_button = QToolButton()
         self.pause_button.setFont(icon_font)
         self.pause_button.clicked.connect(self.toggle_pause)
-        self.more_button = QToolButton()
-        self.more_button.setFont(icon_font)
-        self.more_button.setText(_GLYPH_MORE)
-        self.more_button.setToolTip("More")
-        self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        more_menu = QMenu(self)
-        self.pause_action = more_menu.addAction("Pause capture", self.toggle_pause)
-        self.clear_action = more_menu.addAction("Clear all", self.clear_all)
-        more_menu.addSeparator()
-        self.show_search_action = more_menu.addAction("Show search bar")
-        self.show_search_action.setCheckable(True)
-        self.show_search_action.triggered.connect(
-            lambda on: self.set_layout(show_search=on)
-        )
-        self.show_filters_action = more_menu.addAction("Show filters")
-        self.show_filters_action.setCheckable(True)
-        self.show_filters_action.triggered.connect(
-            lambda on: self.set_layout(show_filters=on)
-        )
-        self.settings_action = more_menu.addAction("Settings...", self.open_settings)
-        self.settings_action.setEnabled(self.settings_panel is not None)
-        self.switch_actions = []
-        if switches:
-            more_menu.addSeparator()
-        for switch in switches or []:
-            action = more_menu.addAction(switch.label)
-            action.setCheckable(True)
-            action.triggered.connect(
-                lambda checked, sw=switch, act=action: self._set_switch(sw, act, checked)
-            )
-            self.switch_actions.append((switch, action))
-        more_menu.aboutToShow.connect(self.sync_switches)
-        more_menu.addSeparator()
-        self.quit_action = more_menu.addAction("Quit Smart Clipboard", self._backend.quit)
-        self.more_button.setMenu(more_menu)
+        # The gear opens the settings panel, which also holds what the old
+        # "..." menu had (search bar, filters, Clear all, Start with Windows, Quit).
+        self.settings_button = QToolButton()
+        self.settings_button.setFont(icon_font)
+        self.settings_button.setText(_GLYPH_SETTINGS)
+        self.settings_button.setToolTip("Settings (Ctrl+,)")
+        self.settings_button.setAccessibleName("Settings")
+        self.settings_button.setEnabled(self.settings_panel is not None)
+        self.settings_button.clicked.connect(self.toggle_settings)
+        if self.settings_panel is not None:
+            self.settings_panel.clear_all_requested.connect(self.clear_all)
+            self.settings_panel.quit_requested.connect(self._backend.quit)
 
         # Shown while paused: what it means, and a way back (UI plan item 5).
         self.pause_banner = QFrame()
@@ -829,12 +1398,21 @@ class SearchWindow(QWidget):
         chips_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         chips_scroll.setFixedHeight(30)
         chips_scroll.viewport().installEventFilter(self)
+        self.chips_bar.installEventFilter(self)
+        self._drag_start: tuple[float, int] | None = None
+        self._dragging = False
         self.chips_scroll = chips_scroll
         chips_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.fade_left = EdgeFade(chips_scroll, right=False)
+        self.fade_right = EdgeFade(chips_scroll, right=True)
+        bar = chips_scroll.horizontalScrollBar()
+        bar.valueChanged.connect(lambda _v: self.update_chip_fades())
+        bar.rangeChanged.connect(lambda _a, _b: self.update_chip_fades())
         self.clear_button = QPushButton("Clear all")
         self.clear_button.setProperty("chip", True)
         self.clear_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.clear_button.setToolTip(CLEAR_TOOLTIP)
+        self.clear_button.setAccessibleName("Clear all")
         self.clear_button.clicked.connect(self.clear_all)
         self.filters_row = QWidget()
         filters_layout = QHBoxLayout(self.filters_row)
@@ -847,7 +1425,8 @@ class SearchWindow(QWidget):
         self.list = QListView()
         self.list.setModel(self.model)
         self.delegate = CardDelegate(self.list)
-        self.list.selectionModel().currentChanged.connect(lambda *_args: self.update_hint())
+        self.delegate.paste_enabled = paster is not None
+        self.list.selectionModel().currentChanged.connect(lambda *_args: self._close_strip_if_moved())
         self.list.setItemDelegate(self.delegate)
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -856,6 +1435,7 @@ class SearchWindow(QWidget):
         self.list.setResizeMode(QListView.ResizeMode.Adjust)
         self.list.setMouseTracking(True)
         self.list.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # keys go to the search box
+        self.list.setAccessibleName("Clipboard items")
         self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._on_context_menu)
         self.delegate.region_clicked.connect(self._on_region_clicked)
@@ -867,11 +1447,6 @@ class SearchWindow(QWidget):
         self.status_label = QLabel()
         self.status_label.setObjectName("status")
         self.status_label.setWordWrap(True)
-        # The keyboard hints (UI plan item 3), switched off in the settings panel.
-        self.hint_label = QLabel()
-        self.hint_label.setObjectName("hint")
-        self.hint_label.setWordWrap(True)
-        self.hint_label.setVisible(show_hints)
         # Floats over the bottom of the window (not in the layout).
         self._undo_items: list[StoredItem] = []
         self.toast = Toast(self, duration_ms=undo_ms)
@@ -885,17 +1460,61 @@ class SearchWindow(QWidget):
         top.addWidget(self.search, 1)
         top.addStretch(0)  # keeps the buttons at the right while the search bar is hidden
         top.addWidget(self.pause_button)
-        top.addWidget(self.more_button)
+        top.addWidget(self.settings_button)
+        # Two pages (UI plan item 6): History, which is everything above, and Insights.
+        self._page = PAGE_HISTORY
+        self.history_page = QWidget()
+        history_layout = QVBoxLayout(self.history_page)
+        history_layout.setContentsMargins(0, 0, 0, 0)
+        history_layout.setSpacing(6)
+        history_layout.addWidget(self.pause_banner)
+        history_layout.addWidget(self.list, 1)
+        history_layout.addWidget(self.empty_label, 1)
+        self.insights_view = InsightsView() if InsightsView is not None else None
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self.history_page)
+        if self.insights_view is not None:
+            self.pages.addWidget(self.insights_view)
+        self.segment = QFrame()
+        self.segment.setObjectName("segment")
+        self.tab_history = QPushButton("History")
+        self.tab_insights = QPushButton("Insights")
+        segment_row = QHBoxLayout(self.segment)
+        segment_row.setContentsMargins(3, 3, 3, 3)
+        segment_row.setSpacing(2)
+        group = QButtonGroup(self.segment)
+        for name, button in ((PAGE_HISTORY, self.tab_history), (PAGE_INSIGHTS, self.tab_insights)):
+            button.setCheckable(True)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            group.addButton(button)
+            segment_row.addWidget(button)
+            button.clicked.connect(lambda _checked=False, page=name: self.set_page(page))
+        self.tab_history.setChecked(True)
+        self.segment.setVisible(self.insights_view is not None)  # no tabs without Insights
         inner = QVBoxLayout(panel)
         inner.setContentsMargins(10, 10, 10, 8)
         inner.setSpacing(6)
-        inner.addLayout(top)
-        inner.addWidget(self.pause_banner)
-        inner.addWidget(self.filters_row)
-        inner.addWidget(self.list, 1)
-        inner.addWidget(self.empty_label, 1)
+        # The handle across the top and the bar it drops down (search, pause,
+        # settings, History | Insights, filter chips).
+        self.handle = QPushButton()
+        self.handle.setObjectName("handle")
+        self.handle.setFont(icon_font)
+        self.handle.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.handle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.handle.setFixedHeight(18)
+        self.handle.clicked.connect(self.toggle_drawer)
+        self.drawer = QWidget()
+        drawer_layout = QVBoxLayout(self.drawer)
+        drawer_layout.setContentsMargins(0, 0, 0, 0)
+        drawer_layout.setSpacing(6)
+        drawer_layout.addLayout(top)
+        drawer_layout.addWidget(self.segment)
+        drawer_layout.addWidget(self.filters_row)
+        inner.addWidget(self.handle)
+        inner.addWidget(self.drawer)
+        inner.addWidget(self.pages, 1)
         inner.addWidget(self.status_label)
-        inner.addWidget(self.hint_label)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(panel)
@@ -905,6 +1524,11 @@ class SearchWindow(QWidget):
             ("Ctrl+R", self.toggle_reveal_selected),
             ("Ctrl+P", self.toggle_pin_selected),
             ("Shift+Del", self.delete_selected),
+            ("Ctrl+F", lambda: self.show_search("")),
+            ("Ctrl+E", self.toggle_actions_selected),
+            ("Ctrl+,", self.toggle_settings),
+            ("Ctrl+Shift+P", self.toggle_pause),
+            ("Ctrl+D", self.toggle_drawer),
             ("Shift+F10", self.open_menu_for_selected),
             ("Menu", self.open_menu_for_selected),
         ):
@@ -921,7 +1545,7 @@ class SearchWindow(QWidget):
         self._timer.timeout.connect(self._tick)
 
         self.apply_theme()
-        self.apply_layout()
+        self.set_drawer(self._start_open, animate=False)
         self.refresh()
 
     # --- Showing and hiding ---
@@ -935,9 +1559,12 @@ class SearchWindow(QWidget):
         self.search.blockSignals(False)
         self._filter = None
         self.reveals.hide_all()
-        self._search_shown_for_now = self._filters_shown_for_now = False
+        self._page = PAGE_HISTORY  # a fresh opening starts on History
+        self.tab_history.setChecked(True)
+        self.filters_row.setVisible(True)
+        self.pages.setCurrentWidget(self.history_page)
         self.apply_theme()
-        self.apply_layout()
+        self.set_drawer(self._start_open, animate=False)
         self.refresh()
         self.move_near_pointer()
         self.show()
@@ -952,48 +1579,93 @@ class SearchWindow(QWidget):
         else:
             self.setFocus()
 
-    # --- Search bar and filters shown or hidden (ui/prefs.py) ---
+    # --- The top bar that drops down (search, filters, pause, settings) ---
 
-    def apply_layout(self) -> None:
-        """Show or hide the search bar and the filter row as chosen."""
-        self.search.setVisible(self.prefs.show_search or self._search_shown_for_now)
-        self.filters_row.setVisible(self.prefs.show_filters or self._filters_shown_for_now)
-        self.show_search_action.setChecked(self.prefs.show_search)
-        self.show_filters_action.setChecked(self.prefs.show_filters)
+    @property
+    def drawer_open(self) -> bool:
+        return self._drawer_open
 
-    def set_layout(self, show_search: bool | None = None, show_filters: bool | None = None) -> None:
-        """Change and remember what shows above the cards (the "..." tick boxes)."""
-        changes: dict[str, bool] = {}
-        if show_search is not None:
-            changes["show_search"] = show_search
-            self._search_shown_for_now = False
-            if not show_search:
-                self.search.clear()  # no hidden search left filtering the cards
-        if show_filters is not None:
-            changes["show_filters"] = show_filters
-            self._filters_shown_for_now = False
-            if not show_filters:
-                self._filter = None  # no hidden filter left on
-        self.prefs = replace(self.prefs, **changes)
-        if not self._prefs_store.save(self.prefs):
-            self.status_label.setText("Could not save this choice; it lasts until restart")
-        self.apply_layout()
-        self.refresh()
+    def toggle_drawer(self) -> None:
+        self.set_drawer(not self._drawer_open)
         self.focus_keys()
 
-    def show_search_for_now(self, text: str) -> None:
-        """Bring back a hidden search bar for this opening, starting with `text`."""
-        self._search_shown_for_now = True
-        self.apply_layout()
+    def set_drawer(self, open_: bool, animate: bool = True) -> None:
+        """Drop the top bar down or fold it away.
+
+        Folding it clears the search and the filter: a hidden search or chip
+        must never keep filtering the cards without being seen.
+        """
+        cleared = False
+        if not open_ and (self.search.text() or self._filter is not None):
+            self.search.blockSignals(True)
+            self.search.clear()
+            self.search.blockSignals(False)
+            self._filter = None
+            cleared = True
+        changed = open_ != self._drawer_open
+        self._drawer_open = open_
+        self.handle.setText(_GLYPH_UP if open_ else _GLYPH_DOWN)
+        label = "Hide search, filters and settings" if open_ else "Show search, filters and settings"
+        self.handle.setToolTip(label)
+        self.handle.setAccessibleName(label)
+        self._place_drawer(animate and changed)
+        if cleared:
+            self.refresh()
+
+    def _place_drawer(self, animate: bool) -> None:
+        """Show or hide the bar, sliding its height when `animate` and the window is on screen."""
+        if self._drawer_anim is not None:
+            self._drawer_anim.stop()
+        open_ = self._drawer_open
+        if not animate or self.drawer_animation_ms <= 0 or not self.isVisible():
+            self.drawer.setMaximumHeight(_NO_LIMIT)
+            self.drawer.setVisible(open_)
+            return
+        full = self.drawer.layout().sizeHint().height()
+        start = self.drawer.height() if self.drawer.isVisible() else 0
+        if open_:
+            self.drawer.setMaximumHeight(max(0, start))
+            self.drawer.setVisible(True)
+        animation = QPropertyAnimation(self.drawer, b"maximumHeight", self)
+        animation.setDuration(self.drawer_animation_ms)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        animation.setStartValue(max(0, start))
+        animation.setEndValue(full if open_ else 0)
+        animation.finished.connect(self._drawer_settled)
+        self._drawer_anim = animation
+        animation.start()
+
+    def _drawer_settled(self) -> None:
+        self.drawer.setMaximumHeight(_NO_LIMIT)
+        self.drawer.setVisible(self._drawer_open)
+
+    def show_search(self, text: str) -> None:
+        """Open the bar (if folded), focus the search box and add `text` to it."""
+        self.set_drawer(True)
         self.search.setFocus()
-        self.search.insert(text)
+        if text:
+            self.search.insert(text)
 
     def apply_theme(self) -> None:
         """Use the light or dark colours that match Windows right now."""
         theme = self._current_theme()
         self.delegate.theme = theme
         self.setStyleSheet(themes.stylesheet(theme))
+        self.fade_left.set_colour(theme.window)
+        self.fade_right.set_colour(theme.window)
         self.list.viewport().update()
+
+    def update_chip_fades(self) -> None:
+        """Show a fade on each side of the chips that has more chips beyond it."""
+        bar = self.chips_scroll.horizontalScrollBar()
+        view = self.chips_scroll.viewport()
+        height = view.height()
+        self.fade_left.setGeometry(0, 0, EdgeFade.WIDTH, height)
+        self.fade_right.setGeometry(view.width() - EdgeFade.WIDTH, 0, EdgeFade.WIDTH, height)
+        self.fade_left.setVisible(bar.value() > bar.minimum())
+        self.fade_right.setVisible(bar.value() < bar.maximum())
+        self.fade_left.raise_()
+        self.fade_right.raise_()
 
     def move_near_pointer(self) -> None:
         pointer = QCursor.pos()
@@ -1012,19 +1684,32 @@ class SearchWindow(QWidget):
     def open_settings(self) -> None:
         """Show the settings panel beside this window."""
         if self.settings_panel is not None:
+            self._panel_opened_at = time.monotonic()
             self.settings_panel.open_beside(self)
+            self.sync_settings_panel()
+
+    def toggle_settings(self) -> None:
+        """The gear: open the panel, or close it if it is already open."""
+        if self.settings_panel is not None and self.settings_panel.isVisible():
+            self.settings_panel.hide()
+        else:
+            self.open_settings()
+
+    def sync_settings_panel(self) -> None:
+        """Show the window's own choices in the panel's Window group."""
+        if self.settings_panel is not None and hasattr(self, "clear_button"):
+            self.settings_panel.set_window_state(bool(self.clearable_rows()))
 
     def hideEvent(self, event: QEvent) -> None:  # noqa: N802 (Qt name)
         # A pending Undo ends with the window: the deletes are already final.
         self.toast.dismiss()
+        self.close_actions(animate=False)
+        self._expanded.clear()
         if self.settings_panel is not None:
             self.settings_panel.hide()
         # Nothing stays revealed behind a hidden window.
         self._timer.stop()
         self.reveals.hide_all()
-        if self._search_shown_for_now or self._filters_shown_for_now:
-            self._search_shown_for_now = self._filters_shown_for_now = False
-            self.apply_layout()
         self.refresh()
         super().hideEvent(event)
 
@@ -1037,8 +1722,10 @@ class SearchWindow(QWidget):
 
     def hide_if_focus_left(self) -> None:
         """Hide when no window of this app has the focus any more."""
-        if self.settings_panel is not None and self.settings_panel.isVisible():
-            return  # the settings panel is ours; it reports when the focus leaves it
+        if time.monotonic() - self._panel_opened_at < 0.4:
+            return  # focus is still moving to the panel just opened
+        # With the panel open this also runs when you click back on this window
+        # and then outside: hiding the window hides the panel too (hideEvent).
         if self.isVisible() and self._active_window() is None and QApplication.activePopupWidget() is None:
             self.hide()
 
@@ -1055,20 +1742,59 @@ class SearchWindow(QWidget):
 
     def set_filter(self, active: Filter | None) -> None:
         self._filter = active
-        if active is not None and not self.prefs.show_filters:
-            # Show the chips for now, so the filter can be seen and cleared.
-            self._filters_shown_for_now = True
-            self.apply_layout()
+        if active is not None and not self._drawer_open:
+            self.set_drawer(True)  # so the filter can be seen and cleared
         self.refresh()
+
+    @property
+    def page(self) -> str:
+        """"history" or "insights": which tab is showing."""
+        return self._page
+
+    def set_page(self, page: str) -> None:
+        """Switch between the History list and the Insights summary."""
+        wanted = page == PAGE_INSIGHTS and self.insights_view is not None
+        self._page = PAGE_INSIGHTS if wanted else PAGE_HISTORY
+        on_insights = self._page == PAGE_INSIGHTS
+        self.tab_insights.setChecked(on_insights)
+        self.tab_history.setChecked(not on_insights)
+        self.filters_row.setVisible(not on_insights)
+        self.pages.setCurrentWidget(self.insights_view if on_insights else self.history_page)
+        if on_insights:
+            self.show_insights()
+        else:
+            self.refresh()
+
+    def _back_to_history(self) -> None:
+        """Typing a search shows the History list again."""
+        if self._page != PAGE_HISTORY:
+            self.set_page(PAGE_HISTORY)
+
+    def show_insights(self) -> None:
+        """Work out the numbers now (they are not kept up to date while open)."""
+        self.insights_view.show_insights(
+            compute_insights(self._backend.items(), self._now()), self._current_theme()
+        )
 
     def refresh(self) -> None:
         """Rebuild the cards from the backend, keeping the selected item selected."""
         selected = self.selected_row()
         items = self._backend.items()
         now = self._now()
-        rows = build_rows(items, self.search.text(), self._filter, self.reveals, now)
+        rows = self._keep_countdowns_falling(
+            build_rows(
+                items, self.search.text(), self._filter, self.reveals, now,
+                expanded=frozenset(self._expanded),
+            )
+        )
+        self._next_expiry = min(
+            (now + row.remaining for row in rows if row.remaining is not None), default=None
+        )
         entries = arrange(rows, now, bool(self.search.text().strip()))
         self.model.set_rows(entries)
+        open_item = self.delegate.actions_item
+        if open_item is not None and self.model.position_of(open_item) is None:
+            self.close_actions(animate=False)  # that card is gone
         cards = self.model.card_positions()
         target = cards[0] if cards else None
         if selected is not None:
@@ -1087,13 +1813,13 @@ class SearchWindow(QWidget):
         self.pause_button.style().unpolish(self.pause_button)
         self.pause_button.style().polish(self.pause_button)
         self.pause_button.setText(_GLYPH_PLAY if paused else _GLYPH_PAUSE)
-        self.pause_button.setToolTip("Resume capture" if paused else "Pause capture")
-        self.pause_action.setText("Resume capture" if paused else "Pause capture")
+        pause_text = "Resume capture" if paused else "Pause capture"
+        self.pause_button.setToolTip(f"{pause_text} (Ctrl+Shift+P)")
+        self.pause_button.setAccessibleName(pause_text)
         self.status_label.setVisible(bool(self.status_label.text()))
-        self.update_hint()
         clearable = bool(self.clearable_rows())
         self.clear_button.setEnabled(clearable)
-        self.clear_action.setEnabled(clearable)
+        self.sync_settings_panel()
 
     def clearable_rows(self) -> list[Row]:
         """What Clear all would delete: the cards shown now, except pinned ones."""
@@ -1105,16 +1831,23 @@ class SearchWindow(QWidget):
             wanted.append(self._filter)  # so an active filter can always be cleared
         if wanted != self._chip_filters:
             self._chip_filters = wanted
-            for chip in self.chips.values():
-                self.chips_layout.removeWidget(chip)
-                chip.hide()  # gone from the screen now, deleted when Qt gets to it
-                chip.deleteLater()
+            # Take out everything, the old stretch spacer too: a leftover spacer
+            # sat in front of the new chips and pushed them to the right.
+            while (entry := self.chips_layout.takeAt(0)) is not None:
+                widget = entry.widget()
+                if widget is not None:
+                    widget.hide()  # gone from the screen now, deleted when Qt gets to it
+                    widget.deleteLater()
             self.chips = {}
             for active in [None, *wanted]:
                 chip = QPushButton("All" if active is None else filter_name(active))
                 chip.setProperty("chip", True)
                 chip.setCheckable(True)
                 chip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                chip.installEventFilter(self)  # so a drag that starts on a chip scrolls
+                chip.setAccessibleName(
+                    "Show all items" if active is None else f"Show only {filter_name(active)}"
+                )
                 chip.clicked.connect(lambda _checked=False, f=active: self.set_filter(f))
                 self.chips_layout.addWidget(chip)
                 self.chips[active] = chip
@@ -1122,7 +1855,16 @@ class SearchWindow(QWidget):
         for active, chip in self.chips.items():
             chip.setChecked(active == self._filter)
 
+    def _close_strip_if_moved(self) -> None:
+        """Moving the selection to another card slides the open strip shut."""
+        open_item = self.delegate.actions_item
+        row = self.selected_row()
+        if open_item is not None and (row is None or row.item_id != open_item):
+            self.close_actions()
+
     def selected_row(self) -> Row | None:
+        if self._page != PAGE_HISTORY:
+            return None  # the hidden list must never act on keys pressed over Insights
         index = self.list.currentIndex()
         return self.model.row_at(index.row()) if index.isValid() else None
 
@@ -1144,10 +1886,34 @@ class SearchWindow(QWidget):
             place = 0 if step > 0 else len(cards) - 1
         self.list.setCurrentIndex(self.model.index(cards[place]))
 
+    def _keep_countdowns_falling(self, rows: list[Row]) -> list[Row]:
+        """Never show more time left than before, even if the clock was set back.
+
+        The real deadline (retention) uses the clock; this only keeps the
+        pill from counting up. Items no longer shown are forgotten.
+        """
+        seen = self._remaining_seen
+        kept: list[Row] = []
+        for row in rows:
+            if row.remaining is not None:
+                lowest = min(row.remaining, seen.get(row.item_id, row.remaining))
+                seen[row.item_id] = lowest
+                if lowest != row.remaining:
+                    row = replace(row, remaining=lowest)
+            kept.append(row)
+        shown = {row.item_id for row in rows}
+        for item_id in [i for i in seen if i not in shown]:
+            del seen[item_id]
+        return kept
+
     def _tick(self) -> None:
         self._ticks += 1
-        expired = self.reveals.expire(self._now())
-        if expired or self._ticks % _AGE_REFRESH_TICKS == 0:
+        now = self._now()
+        expired = self.reveals.expire(now)
+        # A secret reaching its deadline leaves the list right then, not up to
+        # 30 seconds later; the pills themselves update every 30 seconds.
+        due = self._next_expiry is not None and now >= self._next_expiry
+        if expired or due or self._ticks % _AGE_REFRESH_TICKS == 0:
             self.refresh()
 
     # --- Clicks and the card menu ---
@@ -1166,18 +1932,37 @@ class SearchWindow(QWidget):
             self.set_filter(row.state)
         elif region == REGION_TEXT and (row.masked or row.revealed):
             self.toggle_reveal(row)
+        elif region.startswith(TAG_PREFIX):
+            self.set_filter(TagFilter(region[len(TAG_PREFIX):]))
+        elif region == REGION_EXPAND:
+            self.toggle_expand(row)
         elif region == REGION_MENU:
-            self.open_menu(row, global_pos or QCursor.pos())
+            self.toggle_actions(row)
+        elif region == REGION_STRIP:  # the strip's empty area closes it
+            self.close_actions()
+        elif region == REGION_COPY:
+            self.close_actions(animate=False)
+            self.choose(row, paste=False)
+        elif region == REGION_PASTE:
+            self.close_actions(animate=False)
+            self.choose(row, paste=True)
+        elif region == REGION_EDIT:
+            self.edit_names(row, global_pos or QCursor.pos())
         elif region == REGION_REVEAL:
             self.toggle_reveal(row)
         elif region == REGION_PIN:
             self.toggle_pin(row)
         elif region == REGION_MARK:
+            self.close_actions(animate=False)
             if row.state is SecretState.NORMAL:
                 self.mark_secret(row)
             else:
                 self.mark_normal(row)
+        elif region == REGION_MARK_SECRET:
+            self.close_actions(animate=False)
+            self.mark_secret(row)
         elif region == REGION_DELETE:
+            self.close_actions(animate=False)
             self.delete(row)
         else:
             self.choose_selected()
@@ -1201,8 +1986,54 @@ class SearchWindow(QWidget):
         secret = menu.addAction("Mark secret", lambda: self.mark_secret(row))
         secret.setEnabled(row.state is not SecretState.SECRET)
         menu.addSeparator()
+        self._add_naming_actions(menu, row, sensitive)
+        menu.addSeparator()
         menu.addAction("Delete", lambda: self.delete(row))
         return menu
+
+    def _add_naming_actions(self, menu: QMenu, row: Row, sensitive: bool) -> None:
+        """Rename and tags for a pinned item; otherwise a line that says why not."""
+        if row.can_name:
+            menu.addAction("Rename..." if row.title else "Add a name...", lambda: self.rename(row))
+            if row.title:
+                menu.addAction("Remove name", lambda: self.remove_name(row))
+            add = menu.addAction("Add tag...", lambda: self.add_tag(row))
+            add.setEnabled(len(row.tags) < naming.MAX_TAGS)
+            if row.tags:
+                remove = menu.addMenu("Remove tag")
+                for tag in row.tags:
+                    remove.addAction(tag, lambda _checked=False, t=tag: self.remove_tag(row, t))
+            return
+        menu.setToolTipsVisible(True)
+        note = menu.addAction(NAMING_NOTE_SECRET if sensitive else NAMING_NOTE_PIN)
+        note.setEnabled(False)
+        if sensitive:
+            note.setToolTip(NAMING_NOTE_SECRET_TIP)
+
+    # --- The sliding action strip ---
+
+    def toggle_actions(self, row: Row) -> None:
+        """"...": slide the action icons in over the card, or slide them away again."""
+        if self.delegate.is_open(row.item_id):
+            self.close_actions()
+        else:
+            self.delegate.open_actions(row.item_id)
+        self.list.viewport().update()
+
+    def toggle_actions_selected(self) -> None:
+        """Ctrl+E: the keyboard way to press "..." on the selected card."""
+        row = self.selected_row()
+        if row is not None:
+            self.toggle_actions(row)
+
+    def close_actions(self, animate: bool = True) -> None:
+        self.delegate.close_actions(animate)
+
+    def edit_names(self, row: Row, global_pos: QPoint) -> None:
+        """The pencil icon: name and tag choices for a pinned item, as a small menu."""
+        menu = QMenu(self)
+        self._add_naming_actions(menu, row, row.state is not SecretState.NORMAL)
+        menu.exec(global_pos)
 
     def open_menu(self, row: Row, global_pos: QPoint) -> None:
         self.build_menu(row).exec(global_pos)
@@ -1223,6 +2054,48 @@ class SearchWindow(QWidget):
 
     # --- Actions ---
 
+    def rename(self, row: Row) -> None:
+        """Ask for a name for a pinned item. Empty removes it; cancel changes nothing."""
+        if not row.can_name:
+            return
+        text = self._ask_text(self, "Name this item", "Name:", row.title or "", naming.MAX_TITLE_CHARS)
+        if text is None:
+            return
+        self._backend.rename(row.item_id, naming.clean_title(text))
+        self.refresh()
+        self.select_item(row.item_id)
+
+    def remove_name(self, row: Row) -> None:
+        if row.can_name:
+            self._backend.rename(row.item_id, None)
+            self.refresh()
+
+    def add_tag(self, row: Row) -> None:
+        """Ask for one more tag (at most three, no repeats)."""
+        if not row.can_name or len(row.tags) >= naming.MAX_TAGS:
+            return
+        text = self._ask_text(self, "Add a tag", "Tag:", "", naming.MAX_TAG_CHARS)
+        if text is None:
+            return
+        tags = naming.add_tag(row.tags, text)
+        if tags != row.tags:
+            self._backend.set_tags(row.item_id, tags)
+        self.refresh()
+        self.select_item(row.item_id)
+
+    def remove_tag(self, row: Row, tag: str) -> None:
+        if row.can_name:
+            self._backend.set_tags(row.item_id, naming.remove_tag(row.tags, tag))
+            self.refresh()
+
+    def toggle_expand(self, row: Row) -> None:
+        """Open or close "Show more" on one card, in place."""
+        if row.rich is None or not row.rich.expandable:
+            return
+        self._expanded.symmetric_difference_update({row.item_id})
+        self.refresh()
+        self.select_item(row.item_id)
+
     def toggle_reveal(self, row: Row) -> None:
         if row.revealed:
             self.reveals.hide(row.item_id)
@@ -1242,7 +2115,7 @@ class SearchWindow(QWidget):
         False if there is no such card.
         """
         rows = self.model.rows
-        if not 1 <= number <= min(QUICK_PASTE_COUNT, len(rows)):
+        if self._page != PAGE_HISTORY or not 1 <= number <= min(QUICK_PASTE_COUNT, len(rows)):
             return False
         self.choose(rows[number - 1], paste=True)
         return True
@@ -1252,15 +2125,6 @@ class SearchWindow(QWidget):
         if self._notice is None:
             self._notice = Notice()
         self._notice.show_text(COPIED_TEXT, self.styleSheet(), QCursor.pos())
-
-    def set_hints_visible(self, visible: bool) -> None:
-        self._show_hints = visible
-        self.hint_label.setVisible(visible)
-
-    def update_hint(self) -> None:
-        self.hint_label.setText(
-            hint_text(self.selected_row(), self._backend.is_paused(), self._pause_keys)
-        )
 
     def choose_selected(self) -> None:
         row = self.selected_row()
@@ -1362,11 +2226,11 @@ class SearchWindow(QWidget):
         self._place_toast()
 
     def _place_toast(self) -> None:
-        """Float the toast along the bottom, above the hint bar."""
+        """Float the toast along the bottom of the window."""
         margin = 12
         self.toast.setFixedWidth(max(0, self.width() - 2 * margin))
         self.toast.adjustSize()
-        floor = self.hint_label.y() if self.hint_label.isVisible() else self.height() - 8
+        floor = self.height() - 8
         self.toast.move(margin, max(0, floor - self.toast.height() - 6))
 
     def resizeEvent(self, event: QEvent) -> None:  # noqa: N802 (Qt name)
@@ -1382,17 +2246,6 @@ class SearchWindow(QWidget):
     def toggle_pause(self) -> None:
         self._backend.toggle_pause()
         self.refresh()
-
-    def sync_switches(self) -> None:
-        """Tick each switch item to match the real setting (read when the menu opens)."""
-        for switch, action in self.switch_actions:
-            action.setChecked(switch.is_on())
-
-    def _set_switch(self, switch: Switch, action: QAction, on: bool) -> None:
-        if not switch.set_on(on):
-            self.status_label.setText(f"Could not change \"{switch.label}\"")
-            self.status_label.setVisible(True)
-        action.setChecked(switch.is_on())
 
     # --- Keys ---
 
@@ -1422,9 +2275,12 @@ class SearchWindow(QWidget):
 
     def keyPressEvent(self, event: QEvent) -> None:  # noqa: N802 (Qt name)
         key = event.key()  # type: ignore[attr-defined]
-        # Esc pressed anywhere else in the window.
+        # Esc pressed anywhere else in the window: close an open strip first.
         if key == Qt.Key.Key_Escape:
-            self.hide()
+            if self.delegate.actions_item is not None and self.delegate.is_open(self.delegate.actions_item):
+                self.close_actions()
+            else:
+                self.hide()
             return
         if not self.search.isVisibleTo(self):
             if self._quick_key(event) or self._navigate(key):
@@ -1433,21 +2289,56 @@ class SearchWindow(QWidget):
             held = event.modifiers()  # type: ignore[attr-defined]
             control = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier
             if text and text.isprintable() and not held & control:
-                self.show_search_for_now(text)
+                self.show_search(text)
                 return
         super().keyPressEvent(event)  # type: ignore[arg-type]
 
+    def _drag_scroll(self, watched: QObject, event: QEvent) -> bool:
+        """Drag the chip strip sideways with the left button (touch screens, no wheel).
+
+        True if the event was used up: moves while dragging, and the release
+        that ends a drag (so the chip under the pointer is not also clicked).
+        """
+        sources = (self.chips_scroll.viewport(), self.chips_bar, *self.chips.values())
+        if watched not in sources:
+            return False
+        kind = event.type()
+        bar = self.chips_scroll.horizontalScrollBar()
+        if kind == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
+            self._drag_start = (event.globalPosition().x(), bar.value())  # type: ignore[attr-defined]
+            self._dragging = False
+        elif kind == QEvent.Type.MouseMove and self._drag_start is not None:
+            moved = event.globalPosition().x() - self._drag_start[0]  # type: ignore[attr-defined]
+            if self._dragging or abs(moved) > 6:
+                self._dragging = True
+                bar.setValue(round(self._drag_start[1] - moved))
+                return True
+        elif kind == QEvent.Type.MouseButtonRelease:
+            was_dragging = self._dragging
+            self._drag_start, self._dragging = None, False
+            return was_dragging
+        return False
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802 (Qt name)
+        if watched is self.chips_scroll.viewport() and event.type() == QEvent.Type.Resize:
+            self.update_chip_fades()
         if watched is self.chips_scroll.viewport() and event.type() == QEvent.Type.Wheel:
+            # A mouse wheel turns vertically, a touchpad swipe sideways: use whichever is larger.
+            delta = event.angleDelta()  # type: ignore[attr-defined]
+            step = delta.x() if abs(delta.x()) > abs(delta.y()) else delta.y()
             bar = self.chips_scroll.horizontalScrollBar()
-            bar.setValue(bar.value() - event.angleDelta().y())  # type: ignore[attr-defined]
+            bar.setValue(bar.value() - step)
+            return True
+        if self._drag_scroll(watched, event):
             return True
         if watched is self.search and event.type() == QEvent.Type.KeyPress:
             key = event.key()  # type: ignore[attr-defined]
             if self._quick_key(event) or self._navigate(key):
                 return True
             if key == Qt.Key.Key_Escape:
-                if self.search.text():
+                if self.delegate.actions_item is not None and self.delegate.is_open(self.delegate.actions_item):
+                    self.close_actions()
+                elif self.search.text():
                     self.search.clear()
                 else:
                     self.hide()

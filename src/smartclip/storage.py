@@ -38,6 +38,12 @@ Other choices:
   load, with both fields empty.
 - A payload that is pinned while secret or unsure is refused (ValueError when
   built, unreadable when loaded), because secrets cannot be pinned.
+- Version 3 payloads add `title` and `tags` (naming.py), inside the encrypted
+  payload. A payload with neither is still written as version 2, so existing
+  rows and files stay byte-for-byte readable by older copies of the app; only
+  an item the owner named or tagged is written as version 3. A secret or
+  unsure item with a title or tags is refused like a pinned secret, because a
+  title could reveal what the secret is.
 
 Threading: a Store must be used from the thread that created it.
 """
@@ -50,12 +56,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Self
 
-from smartclip import dpapi, logsafe
+from smartclip import dpapi, logsafe, naming
 from smartclip.labels import Label, SecretState
 
 PAYLOAD_VERSION = 2
-# Versions load_all() can read. Version 1 has no dedupe_key or last_copied_at.
-_READABLE_VERSIONS = frozenset({1, 2})
+# Written only for an item that has a title or tags (see the module notes).
+NAMED_PAYLOAD_VERSION = 3
+# Versions load_all() can read. Version 1 has no dedupe_key or last_copied_at;
+# versions 1 and 2 have no title or tags.
+_READABLE_VERSIONS = frozenset({1, 2, 3})
 # The only kind in this version. The field exists so that other kinds can be
 # added later without migrating existing rows.
 KIND_TEXT = "text"
@@ -113,15 +122,22 @@ class ItemPayload:
     kind: str = KIND_TEXT
     dedupe_key: str | None = None
     last_copied_at: datetime | None = None
+    title: str | None = None
+    tags: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.pinned and self.secret_state is not SecretState.NORMAL:
             raise ValueError("secret and unsure items cannot be pinned")
+        if (self.title or self.tags) and self.secret_state is not SecretState.NORMAL:
+            raise ValueError("secret and unsure items cannot have a title or tags")
+        if not naming.title_is_valid(self.title) or not naming.tags_are_valid(self.tags):
+            raise ValueError("title or tags outside the allowed shape")
 
     def to_bytes(self) -> bytes:
         """Serialize to JSON bytes, ready to be encrypted."""
-        data = {
-            "v": PAYLOAD_VERSION,
+        named = bool(self.title or self.tags)
+        data: dict[str, object] = {
+            "v": NAMED_PAYLOAD_VERSION if named else PAYLOAD_VERSION,
             "kind": self.kind,
             "content": self.content,
             "label": self.label.value,
@@ -132,6 +148,9 @@ class ItemPayload:
             "dedupe_key": self.dedupe_key,
             "last_copied_at": _optional_time_text(self.last_copied_at),
         }
+        if named:
+            data["title"] = self.title
+            data["tags"] = list(self.tags)
         return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     @classmethod
@@ -162,6 +181,12 @@ class ItemPayload:
         expires_text = data["expires_at"]
         dedupe_key = data["dedupe_key"] if version >= 2 else None
         last_copied_text = data["last_copied_at"] if version >= 2 else None
+        title = data["title"] if version >= 3 else None
+        raw_tags = data["tags"] if version >= 3 else []
+        if title is not None and not isinstance(title, str):
+            raise TypeError
+        if not isinstance(raw_tags, list) or not all(isinstance(tag, str) for tag in raw_tags):
+            raise TypeError
         if not isinstance(content, str) or not isinstance(pinned, bool):
             raise TypeError
         for optional_text in (source_app, dedupe_key, expires_text, last_copied_text):
@@ -177,6 +202,8 @@ class ItemPayload:
             kind=KIND_TEXT,
             dedupe_key=dedupe_key,
             last_copied_at=None if last_copied_text is None else _from_utc_text(last_copied_text),
+            title=title,
+            tags=tuple(raw_tags),
         )
 
 

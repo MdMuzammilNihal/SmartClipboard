@@ -32,11 +32,13 @@ SECURITY REVIEW (owner): what the window can show, and what search can see.
 - Nothing here logs, prints, or stores content.
 """
 
+import json
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone, tzinfo
 
-from smartclip import config, retention
+from smartclip import config, naming, retention
 from smartclip.labels import Label, SecretState
 from smartclip.storage import StoredItem
 
@@ -77,8 +79,21 @@ STATE_BADGES: dict[SecretState, Badge] = {
     SecretState.UNSURE: Badge("Review?", "#f59f00", "#212529"),
 }
 
-# A badge filter is either a content type or a secret state.
-Filter = Label | SecretState
+@dataclass(frozen=True)
+class TagFilter:
+    """A filter chip for one tag (UI plan item 9). Tags are compared ignoring case."""
+
+    name: str
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, TagFilter) and naming.tag_key(self.name) == naming.tag_key(other.name)
+
+    def __hash__(self) -> int:
+        return hash(naming.tag_key(self.name))
+
+
+# A badge filter is a content type, a secret state, or a tag.
+Filter = Label | SecretState | TagFilter
 
 
 @dataclass(frozen=True)
@@ -99,6 +114,15 @@ class Row:
     can_pin: bool
     # When the item was last copied (UTC). Decides its day group; never shown.
     copied_at: datetime = datetime.min.replace(tzinfo=timezone.utc)
+    # Time left before retention deletes a secret or Review? item; None for normal items.
+    remaining: timedelta | None = None
+    # How the card body is drawn for a normal item (see Preview); None for masked
+    # or revealed secrets, which always show as plain text or bullets.
+    rich: "Preview | None" = None
+    # The owner's name and tags for a pinned item (naming.py); never on secrets.
+    title: str | None = None
+    tags: tuple[str, ...] = ()
+    can_name: bool = False  # pinned and not secret: the card menu offers Rename and Add tag
 
 
 class RevealState:
@@ -168,13 +192,20 @@ def matches(item: StoredItem, query: str, active: Filter | None, masked: bool) -
         return False
     if isinstance(active, SecretState) and payload.secret_state is not active:
         return False
+    if isinstance(active, TagFilter) and not any(
+        naming.tag_key(tag) == naming.tag_key(active.name) for tag in payload.tags
+    ):
+        return False
     words = query.casefold().split()
     if not words:
         return True
     if masked:
         # Never matched by anything while masked (see SECURITY REVIEW above).
         return False
-    haystack = f"{payload.content}\n{payload.source_app or ''}".casefold()
+    # Titles and tags count as text, but only reach here for a normal item
+    # (secrets cannot have any, and a masked item returned above).
+    named = " ".join([payload.title or "", *payload.tags])
+    haystack = f"{payload.content}\n{payload.source_app or ''}\n{named}".casefold()
     return all(word in haystack for word in words)
 
 
@@ -184,6 +215,8 @@ def build_rows(
     active: Filter | None,
     reveals: RevealState,
     now: datetime,
+    policy: retention.RetentionPolicy | None = None,
+    expanded: frozenset[int] = frozenset(),
 ) -> list[Row]:
     """The rows to show, in the order given (History.items() is newest first).
 
@@ -191,12 +224,19 @@ def build_rows(
     source app; every word must appear.
     """
     rows: list[Row] = []
+    policy = policy or retention.RetentionPolicy()
     for item in items:
+        payload = item.payload
+        sensitive = retention.is_sensitive(payload)
+        remaining: timedelta | None = None
+        if sensitive:
+            deadline = retention.deadline(item, policy)
+            remaining = deadline - now if deadline is not None else None
+            if remaining is not None and remaining <= timedelta(0):
+                continue  # expired; hidden now, deleted at the next cleanup
         masked = is_masked(item, reveals, now)
         if not matches(item, query, active, masked):
             continue
-        payload = item.payload
-        sensitive = retention.is_sensitive(payload)
         rows.append(
             Row(
                 item_id=item.id,
@@ -212,6 +252,11 @@ def build_rows(
                 pinned=payload.pinned,
                 can_pin=not sensitive,
                 copied_at=retention.last_copied(item),
+                remaining=remaining,
+                rich=None if sensitive else preview_for(payload.label, payload.content, item.id in expanded),
+                title=payload.title,
+                tags=payload.tags,
+                can_name=payload.pinned and not sensitive,
             )
         )
     return rows
@@ -219,6 +264,8 @@ def build_rows(
 
 def filter_name(active: Filter) -> str:
     """The text shown for the active badge filter."""
+    if isinstance(active, TagFilter):
+        return f"#{active.name}"
     if isinstance(active, Label):
         return LABEL_BADGES[active].text
     return STATE_BADGES[active].text
@@ -285,28 +332,182 @@ def arrange(
     return arranged
 
 
-# --- The hint bar (UI plan item 3) ---
+# --- Quick paste (UI plan item 3) ---
 
 QUICK_PASTE_COUNT = 9
 
 
-def hint_text(row: Row | None, paused: bool, pause_keys: str) -> str:
-    """The keyboard hints under the list. Fixed words only, never item text.
+# --- The secret countdown (UI plan item 7) ---
 
-    It changes with what is selected: a secret or Review? card shows reveal,
-    a normal card shows pin. While capture is paused it says how to resume.
+COUNTDOWN_WARNING = timedelta(minutes=15)  # the pill turns amber below this
+COUNTDOWN_DANGER = timedelta(minutes=2)  # and red below this
+
+
+def countdown_text(remaining: timedelta) -> str:
+    """"1h 42m left", "42m left" or "under 1 min left". Time only, never content."""
+    seconds = max(0, int(remaining.total_seconds()))
+    if seconds < 60:
+        return "under 1 min left"
+    hours, minutes = divmod(seconds // 60, 60)
+    return f"{hours}h {minutes}m left" if hours else f"{minutes}m left"
+
+
+def countdown_level(remaining: timedelta) -> str:
+    """"danger" under 2 minutes, "warning" under 15, otherwise "normal"."""
+    if remaining < COUNTDOWN_DANGER:
+        return "danger"
+    if remaining < COUNTDOWN_WARNING:
+        return "warning"
+    return "normal"
+
+
+# --- Rich previews by type (UI plan item 8) ---
+
+MAX_PREVIEW_INPUT = 4000  # text handed to any pattern or splitter; keeps patterns fast
+JSON_PARSE_LIMIT = 20000  # bigger JSON stays plain text
+COLLAPSED_LINES = 4  # code, shell and SQL, and error text, before "Show more"
+EXPANDED_LINES = 12  # after "Show more"
+JSON_KEYS_SHOWN = 8
+LONG_TEXT_CHARS = 600  # how much of a long note "Show more" reveals
+_LINK = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)?(?P<host>[^/\s?#]+)(?P<rest>\S*)")
+_COLOUR = re.compile(r"#[0-9A-Fa-f]{6}")
+_CODE_LABELS = (Label.CODE, Label.SHELL_COMMAND, Label.SQL)
+
+
+@dataclass(frozen=True)
+class Seg:
+    """A piece of one preview line: text, how it looks, and where to cut it if too long."""
+
+    text: str
+    style: str = "normal"  # "normal", "bold", "muted" or "mono"
+    elide: str = "right"  # "right", or "middle" for the long part of a link or path
+
+
+@dataclass(frozen=True)
+class Preview:
+    """What the body of a normal card shows. Pure data: the window draws it.
+
+    `lines` are drawn one per row and cut with "..." to the card width,
+    except when `wrap` is set: then the single paragraph is wrapped to the
+    card width. `expandable` means a "Show more" toggle is offered;
+    `expanded` says it is open.
     """
-    if paused:
-        return f"Paused: {pause_keys} resumes capture · Enter paste · Esc close"
-    parts = ["Enter paste"]
-    if row is not None:
-        if row.state is not SecretState.NORMAL:
-            parts.append("Ctrl+R reveal")
-        elif row.pinned:
-            parts.append("Ctrl+P unpin")
-        else:
-            parts.append("Ctrl+P pin")
-        parts.append("Shift+Del delete")
-    parts.append(f"Alt+1-{QUICK_PASTE_COUNT} quick paste")
-    parts.append("Esc close")
-    return " · ".join(parts)
+
+    kind: str  # "plain", "link", "json", "code", "path", "error" or "colour"
+    lines: tuple[tuple[Seg, ...], ...]
+    wrap: bool = False
+    swatch: str | None = None  # "#rrggbb" for a colour swatch before the text
+    chip: str | None = None  # file extension shown as a small chip (paths)
+    expandable: bool = False
+    expanded: bool = False
+
+
+def preview_for(label: Label, content: str, expanded: bool = False) -> Preview:
+    """The preview for a normal (non-secret) item. Never called for masked secrets.
+
+    Falls back to plain wrapped text whenever the text does not fit its
+    type's shape (for example a link label on text with spaces).
+    """
+    text = content[:MAX_PREVIEW_INPUT]
+    stripped = text.strip()
+    if _COLOUR.fullmatch(stripped):
+        return Preview("colour", ((Seg(stripped),),), swatch=stripped.lower())
+    made: Preview | None = None
+    if label is Label.LINK:
+        made = _link_preview(stripped)
+    elif label is Label.JSON:
+        made = _json_preview(content, expanded)
+    elif label in _CODE_LABELS:
+        made = _code_preview(text, expanded)
+    elif label is Label.FILE_PATH:
+        made = _path_preview(stripped)
+    elif label is Label.ERROR_MESSAGE:
+        made = _error_preview(text, expanded)
+    return made or _plain_preview(content, expanded)
+
+
+def _plain_preview(content: str, expanded: bool) -> Preview:
+    collapsed = " ".join(content[: MAX_PREVIEW_INPUT].split())
+    long = len(" ".join(content.split())) > PREVIEW_CHARS
+    if expanded and long:
+        shown = collapsed if len(collapsed) <= LONG_TEXT_CHARS else collapsed[: LONG_TEXT_CHARS - 1] + "\u2026"
+    else:
+        shown = preview_text(content)
+    return Preview("plain", ((Seg(shown),),), wrap=True, expandable=long, expanded=expanded and long)
+
+
+def _link_preview(text: str) -> Preview | None:
+    if not text or any(ch.isspace() for ch in text):
+        return None
+    found = _LINK.fullmatch(text)
+    if found is None:
+        return None
+    host, rest = found.group("host"), found.group("rest")
+    return Preview("link", ((Seg(host, "bold"), Seg(rest, "muted", "middle")),))
+
+
+def _json_preview(content: str, expanded: bool) -> Preview | None:
+    if len(content) > JSON_PARSE_LIMIT:
+        return None
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or not data:
+        return None
+    if expanded:
+        pretty = json.dumps(data, indent=2, ensure_ascii=False).splitlines()
+        shown = pretty[:EXPANDED_LINES]
+        if len(pretty) > EXPANDED_LINES:
+            shown[-1] = "\u2026"
+        return Preview(
+            "json", tuple((Seg(line, "mono"),) for line in shown), expandable=True, expanded=True
+        )
+    keys = [str(key) for key in list(data)[:JSON_KEYS_SHOWN]]
+    more = ", \u2026" if len(data) > JSON_KEYS_SHOWN else ""
+    summary = "{ " + ", ".join(keys) + more + " }"
+    return Preview("json", ((Seg(summary),),), expandable=True)
+
+
+def _code_preview(text: str, expanded: bool) -> Preview | None:
+    lines = [line.expandtabs(4).rstrip() for line in text.splitlines()]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return None
+    limit = EXPANDED_LINES if expanded else COLLAPSED_LINES
+    shown = lines[:limit]
+    if len(lines) > limit:
+        shown[-1] = shown[-1] + " \u2026"
+    return Preview(
+        "code",
+        tuple((Seg(line, "mono"),) for line in shown),
+        expandable=len(lines) > COLLAPSED_LINES,
+        expanded=expanded and len(lines) > COLLAPSED_LINES,
+    )
+
+
+def _path_preview(text: str) -> Preview | None:
+    if not text or "\n" in text:
+        return None
+    cut = max(text.rfind("\\"), text.rfind("/"))
+    folder, name = text[: cut + 1], text[cut + 1 :]
+    if not name:
+        return None
+    extension = name.rpartition(".")[2].lower() if "." in name.strip(".") else ""
+    chip = extension if extension.isalnum() and len(extension) <= 6 else None
+    segments = (Seg(folder, "muted", "middle"), Seg(name, "bold")) if folder else (Seg(name, "bold"),)
+    return Preview("path", (segments,), chip=chip)
+
+
+def _error_preview(text: str, expanded: bool) -> Preview | None:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    limit = EXPANDED_LINES if expanded else COLLAPSED_LINES - 1  # the bold line plus two
+    rest = lines[1:limit]
+    shown = ((Seg(lines[0], "bold"),), *((Seg(line, "muted"),) for line in rest))
+    more = len(lines) > COLLAPSED_LINES - 1
+    return Preview("error", shown, expandable=more, expanded=expanded and more)

@@ -32,7 +32,8 @@ from smartclip.sourceapp import exe_name
 _log = logsafe.get_logger("settings")
 
 NORMAL_DAYS_RANGE = (1, 3650)
-SECRET_MINUTES_RANGE = (5, 1440)
+SECRET_HOURS_RANGE = (1, 24)
+_LEGACY_MINUTES_RANGE = (5, 1440)  # the first version of the file stored minutes
 MAX_EXCLUDED_APPS = 50
 FONT_CHOICES = ("plex", "system")
 # A plain Windows executable name: letters, digits, spaces and . _ - ( ) only.
@@ -57,11 +58,10 @@ class Settings:
     """Everything the settings panel edits."""
 
     normal_retention_days: int = config.NORMAL_RETENTION.days
-    secret_retention_minutes: int = int(config.SECRET_RETENTION.total_seconds() // 60)
+    secret_retention_hours: int = int(config.SECRET_RETENTION.total_seconds() // 3600)
     excluded_apps: tuple[str, ...] = ()
     pause_on_start: bool = False
     font: str = "plex"
-    show_hints: bool = True
 
     @property
     def normal_retention(self) -> timedelta:
@@ -69,7 +69,7 @@ class Settings:
 
     @property
     def secret_retention(self) -> timedelta:
-        return timedelta(minutes=self.secret_retention_minutes)
+        return timedelta(hours=self.secret_retention_hours)
 
 
 def _in_range(value: object, low_high: tuple[int, int]) -> bool:
@@ -99,14 +99,16 @@ def from_raw(raw: object) -> Settings:
     values: dict[str, Any] = {}
     if _in_range(raw.get("normal_retention_days"), NORMAL_DAYS_RANGE):
         values["normal_retention_days"] = raw["normal_retention_days"]
-    if _in_range(raw.get("secret_retention_minutes"), SECRET_MINUTES_RANGE):
-        values["secret_retention_minutes"] = raw["secret_retention_minutes"]
+    if _in_range(raw.get("secret_retention_hours"), SECRET_HOURS_RANGE):
+        values["secret_retention_hours"] = raw["secret_retention_hours"]
+    elif _in_range(raw.get("secret_retention_minutes"), _LEGACY_MINUTES_RANGE):
+        # A file written before the setting was in hours: round up to whole hours.
+        values["secret_retention_hours"] = max(1, -(-raw["secret_retention_minutes"] // 60))
     apps = _clean_apps(raw.get("excluded_apps"))
     if apps is not None:
         values["excluded_apps"] = apps
-    for name in ("pause_on_start", "show_hints"):
-        if isinstance(raw.get(name), bool):
-            values[name] = raw[name]
+    if isinstance(raw.get("pause_on_start"), bool):
+        values["pause_on_start"] = raw["pause_on_start"]
     if raw.get("font") in FONT_CHOICES:
         values["font"] = raw["font"]
     return Settings(**values)

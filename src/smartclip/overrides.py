@@ -63,6 +63,8 @@ def mark_secret(
         secret_state=SecretState.SECRET,
         pinned=False,
         expires_at=now + retention,
+        title=None,  # a title could reveal what the secret is (naming.py)
+        tags=(),
     )
 
 

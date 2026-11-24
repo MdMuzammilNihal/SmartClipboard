@@ -8,7 +8,7 @@ A local, privacy-focused clipboard manager for Windows. It remembers what you co
   <img src="docs/img/window-light.png" alt="Light theme" width="300">
 </p>
 
-<sub>Images are the real window rendered off-screen from made-up data (no real clipboard content). The demo plays as an animated PNG: type a search, filter to secrets, reveal a masked item.</sub>
+<sub>Images are the real window rendered off-screen from made-up data (no real clipboard content). The demo plays as an animated PNG: type a search, filter to secrets, reveal a masked item, open a card's actions.</sub>
 
 > **Not a password manager.** Don't store real passwords in it. Its value is automatic sorting of everyday clipboard text, and handling anything that looks like a secret carefully.
 
@@ -21,11 +21,11 @@ Win+V keeps about 25 items, has no search or labels, and loses history on restar
 - **Encrypted at rest:** one DPAPI-encrypted payload per row; only `id` and `created_at` are plaintext (a test inspects the file). Dedupe uses a DPAPI-protected HMAC key, so short secrets can't be brute-forced from the database.
 - **Capture and labels:** event-based listener on its own thread, 12 rule-based labels, three-outcome secret detection (normal / secret / "Review?") with thresholds in config.
 - **Privacy controls:** pause, app exclusion list, respect for the Windows opt-out formats, safe paste-back of secrets (cleared after 30 s only if nothing newer was copied).
-- **Window:** frameless, opens at the pointer; day groups, filter chips, pinning, masked secrets that never match a search, paste into the previous app (`Alt+1` to `Alt+9` for the first nine), Undo for deletes and Clear all, a settings panel, light/dark following Windows, hidden from screen capture.
+- **Window:** frameless, opens at the pointer; day groups, filter chips, pinning with optional names and tags, previews by type (link domain, JSON keys, code, file name, error first line, colour swatch) with "Show more", a countdown on secrets, masked secrets that never match a search, paste into the previous app (`Alt+1` to `Alt+9` for the first nine), Undo for deletes and Clear all, a settings panel, light/dark following Windows, hidden from screen capture.
 - **Hotkeys** via `RegisterHotKey` (no global keyboard hook): `Ctrl+Alt+V` open, `Ctrl+Alt+P` pause, `Ctrl+Alt+S` mark secret, `Ctrl+Alt+F` force-save.
 - **Never logs clipboard text** (tested) and **makes no network calls** (see below).
 
-Source about 8,000 lines in 32 modules; 881 tests on fake data (12 opt-in real-clipboard tests, 17 known mislabels kept as expected failures). Dependencies: `pywin32`, `PySide6`, pinned `winrt-*` packages (Win+V cleanup). Status: Phase 1 built, a week of daily use under way.
+Source about 9,300 lines in 34 modules; 1,073 tests on fake data (12 opt-in real-clipboard tests, 17 known mislabels kept as expected failures). Dependencies: `pywin32`, `PySide6`, pinned `winrt-*` packages (Win+V cleanup). Status: Phase 1 built, a week of daily use under way.
 
 ## Install and run
 
@@ -37,7 +37,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m smartclip
 ```
 
-Click a card or press Enter to paste into the app you were using; type to search; click a badge or chip to filter; click the bullets (or `Ctrl+R`) to reveal a secret. Deleting and Clear all (pinned items are kept) act at once, with **Undo** for 5 seconds. Options are in **"..." > Settings**, including Start with Windows. Quit from the "..." menu (closing only hides the window). Tests: `.\.venv\Scripts\python.exe -m pytest -q` (opt-in real-clipboard tests need `SMARTCLIP_REAL_CLIPBOARD_TESTS=1`). Data lives in `%LOCALAPPDATA%\SmartClipboard\`, never in the repo.
+Click a card or press Enter to paste into the app you were using; type to search; click a badge or chip to filter; click the bullets (or `Ctrl+R`) to reveal a secret. Deleting and Clear all (pinned items are kept) act at once, with **Undo** for 5 seconds. The handle at the top of the window drops down the search, filters, pause and a **settings** gear (retention, font, Start with Windows, a list of every keyboard shortcut, Clear all and Quit; closing the window only hides it). Each card has Pin and a "..." button that slides in copy, paste, mark secret/normal and delete. Tests: `.\.venv\Scripts\python.exe -m pytest -q` (opt-in real-clipboard tests need `SMARTCLIP_REAL_CLIPBOARD_TESTS=1`). Data lives in `%LOCALAPPDATA%\SmartClipboard\`, never in the repo.
 
 ## Threat model
 

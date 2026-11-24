@@ -13,6 +13,7 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from smartclip.ui.notice import Notice  # noqa: E402
+from qt_wait import wait_for  # noqa: E402
 from smartclip.ui.paste import PASTE_TIMEOUT, Paster  # noqa: E402
 from smartclip.ui.window import COPIED_TEXT, PAUSED_TEXT, SearchWindow  # noqa: E402
 from test_paste import (  # noqa: E402
@@ -108,8 +109,7 @@ def test_notice_shows_text_near_the_point_then_goes(qapp: QApplication) -> None:
     notice.show_text(COPIED_TEXT, "", QPoint(200, 200))
     assert notice.isVisible() and notice.label.text() == COPIED_TEXT
     assert not notice.isActiveWindow()  # never takes the focus
-    QTest.qWait(120)
-    assert not notice.isVisible()
+    assert wait_for(lambda: not notice.isVisible(), 3000)
 
 
 def test_notice_stays_on_screen_at_an_edge(qapp: QApplication) -> None:

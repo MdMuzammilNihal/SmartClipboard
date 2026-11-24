@@ -58,3 +58,7 @@ PHASE2.md
 
 # --- Owner's personal tracker spreadsheets ---
 docs/*.xlsx
+
+# --- Local-only extras (the app runs without them; tests skip when absent) ---
+src/smartclip/ui/insights.py
+tests/test_insights.py
