@@ -19,14 +19,14 @@ Win+V keeps about 25 items, has no search or labels, and loses history on restar
 ## Highlights
 
 - **Encrypted at rest:** one DPAPI-encrypted payload per row; only `id` and `created_at` are plaintext (a test inspects the file). Dedupe uses a DPAPI-protected HMAC key, so short secrets can't be brute-forced from the database.
-- **Capture and labels:** event-based listener on its own thread, 12 rule-based labels, three-outcome secret detection (normal / secret / "Review?") with thresholds in config.
+- **Capture and labels:** event-based listener on its own thread, 12 rule-based content types plus "possible secret", three-outcome secret detection (normal / secret / "Review?") with thresholds in config.
 - **Privacy controls:** pause, app exclusion list, respect for the Windows opt-out formats, safe paste-back of secrets (cleared after 30 s only if nothing newer was copied).
 - **Window:** frameless, opens at the pointer or, if you choose "Where I left it" in settings, where you last dragged it by its top handle; day groups, filter chips, pinning with optional names and tags, previews by type (link domain, JSON keys, code, file name, error first line, colour swatch) with "Show more", a countdown on secrets, masked secrets that never match a search, paste into the previous app (`Alt+1` to `Alt+9` for the first nine), Undo for deletes and Clear all, a settings panel, light/dark following Windows, hidden from screen capture.
-- **Tray icon**: shows the app is running (grey while capture is paused); click it to open the window, right-click for Open, Pause or Resume, and Quit.
+- **Tray icon:** shows the app is running (grey while capture is paused); click it to open the window, right-click for Open, Pause or Resume, and Quit.
 - **Hotkeys** via `RegisterHotKey` (no global keyboard hook): `Ctrl+Alt+V` open, `Ctrl+Alt+P` pause, `Ctrl+Alt+S` mark secret, `Ctrl+Alt+F` force-save.
 - **Never logs clipboard text** (tested) and **makes no network calls** (see below).
 
-Source about 9,300 lines in 34 modules; 1,073 tests on fake data (12 opt-in real-clipboard tests, 17 known mislabels kept as expected failures). Dependencies: `pywin32`, `PySide6`, pinned `winrt-*` packages (Win+V cleanup). Status: Phase 1 built, a week of daily use under way.
+Source about 10,200 lines in 39 files; about 1,180 tests on fake data (12 opt-in real-clipboard tests, 17 known mislabels kept as expected failures). Dependencies: `pywin32`, `PySide6`, pinned `winrt-*` packages (Win+V cleanup). Status: Phase 1 built, a week of daily use under way.
 
 ## Install and run
 
