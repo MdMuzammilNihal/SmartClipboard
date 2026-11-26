@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from smartclip.ui import theme as themes
+from smartclip.ui.geometry import centre_over
 
 
 class ConfirmDialog(QDialog):
@@ -110,9 +111,10 @@ class ConfirmDialog(QDialog):
     def showEvent(self, event: QEvent) -> None:  # noqa: N802 (Qt name)
         super().showEvent(event)
         parent = self.parentWidget()
-        if parent is not None:  # centred over the main window
-            centre = parent.geometry().center()
-            self.move(centre.x() - self.width() // 2, centre.y() - self.height() // 2)
+        if parent is not None:  # centred over the main window, kept on its screen
+            screen = parent.screen() or self.screen()
+            area = screen.availableGeometry() if screen else parent.geometry()
+            self.move(centre_over(parent.geometry(), self.size(), area))
         QTimer.singleShot(0, self.raise_)
         QTimer.singleShot(0, self.activateWindow)
 

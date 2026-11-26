@@ -38,11 +38,13 @@ from PySide6.QtWidgets import (
 
 from smartclip import settings as settings_module
 from smartclip.settings import Settings, SettingsStore
+from smartclip.ui.geometry import fit_size
 
 # Same size as the main window (window.WINDOW_SIZE; a test keeps them equal).
 PANEL_WIDTH = 380
 PANEL_HEIGHT = 520
 FONT_LABELS = {"plex": "IBM Plex Serif", "system": "Windows default (Segoe UI)"}
+POSITION_LABELS = {"pointer": "Next to the pointer", "remembered": "Where I left it"}
 
 
 class SwitchLike(Protocol):
@@ -96,6 +98,10 @@ class SettingsPanel(QWidget):
         for key in settings_module.FONT_CHOICES:
             self.font_box.addItem(FONT_LABELS[key], key)
 
+        self.position_box = QComboBox()
+        for key in settings_module.POSITION_CHOICES:
+            self.position_box.addItem(POSITION_LABELS[key], key)
+
         # --- Privacy ---
         self.normal_days = QSpinBox()
         self.normal_days.setRange(*settings_module.NORMAL_DAYS_RANGE)
@@ -117,7 +123,7 @@ class SettingsPanel(QWidget):
 
         body = QVBoxLayout()
         body.setContentsMargins(16, 12, 16, 12)
-        body.setSpacing(8)
+        body.setSpacing(6)
         title = QLabel("Settings")
         title_font = QFont(title.font())
         title_font.setPixelSize(16)
@@ -130,6 +136,7 @@ class SettingsPanel(QWidget):
 
         body.addWidget(self._section("APPEARANCE"))
         body.addLayout(self._row("Font", self.font_box))
+        body.addLayout(self._row("Window opens", self.position_box))
 
         body.addWidget(self._section("PRIVACY"))
         # The unit is a plain label beside the box: only the number can be edited.
@@ -183,6 +190,9 @@ class SettingsPanel(QWidget):
         self.font_box.currentIndexChanged.connect(
             lambda _i: self._commit(font=self.font_box.currentData())
         )
+        self.position_box.currentIndexChanged.connect(
+            lambda _i: self._commit(window_position=self.position_box.currentData())
+        )
         self.normal_days.valueChanged.connect(
             lambda value: self._commit(normal_retention_days=value)
         )
@@ -225,16 +235,17 @@ class SettingsPanel(QWidget):
         """Show the current settings without saving anything."""
         s = self.settings
         for widget in (
-            self.font_box, self.normal_days, self.secret_hours,
+            self.font_box, self.position_box, self.normal_days, self.secret_hours,
             self.pause_on_start,
         ):
             widget.blockSignals(True)
         self.font_box.setCurrentIndex(max(0, self.font_box.findData(s.font)))
+        self.position_box.setCurrentIndex(max(0, self.position_box.findData(s.window_position)))
         self.normal_days.setValue(s.normal_retention_days)
         self.secret_hours.setValue(s.secret_retention_hours)
         self.pause_on_start.setChecked(s.pause_on_start)
         for widget in (
-            self.font_box, self.normal_days, self.secret_hours,
+            self.font_box, self.position_box, self.normal_days, self.secret_hours,
             self.pause_on_start,
         ):
             widget.blockSignals(False)
@@ -273,6 +284,10 @@ class SettingsPanel(QWidget):
         self.hide()  # the question belongs to the window, not to this panel
         self.clear_all_requested.emit()
 
+    def remember_position(self, x: int, y: int) -> bool:
+        """Save where the owner left the window (two numbers; used by "Where I left it")."""
+        return self._commit(window_x=x, window_y=y)
+
     def set_window_state(self, can_clear: bool) -> None:
         """Match the Clear all button to the window (called by the window)."""
         self.clear_button.setEnabled(can_clear)
@@ -284,6 +299,10 @@ class SettingsPanel(QWidget):
         self.load_from_settings()
         self.status_label.setText("")
         screen = anchor.screen().availableGeometry() if anchor.screen() else None
+        # Same size as the window, which may have been shortened to fit a short screen.
+        self.resize(anchor.size() if anchor.isVisible() else self.size())
+        if screen is not None:
+            self.resize(fit_size(self.size(), screen))
         x = anchor.x() + anchor.width() + 8
         if screen is not None and x + self.width() > screen.right():
             x = anchor.x() - self.width() - 8

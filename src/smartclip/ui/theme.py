@@ -112,6 +112,7 @@ ICON_DIR = Path(__file__).with_name("icons")
 
 # Corner radii in pixels (UI plan item 11). Chips and badges are pills
 # (badges are drawn with half their height as the radius, in window.py).
+SEARCH_BOTTOM_LINE = 2  # px: the purple line under the search box
 WINDOW_RADIUS = 14
 CARD_RADIUS = 12
 BUTTON_RADIUS = 10
@@ -172,9 +173,14 @@ def stylesheet(theme: Theme) -> str:
         }}
         #search {{
             background: {t.input}; color: {t.text}; border: 1px solid {t.border};
-            border-bottom: 2px solid {t.accent}; border-radius: {BUTTON_RADIUS}px;
-            padding: 6px 8px;
+            border-bottom: {SEARCH_BOTTOM_LINE}px solid {t.accent}; border-radius: {BUTTON_RADIUS}px;
+            padding: 6px 30px 6px 8px;  /* room on the right for the x */
         }}
+        #searchClear {{
+            min-width: 22px; min-height: 22px; max-width: 22px; max-height: 22px;
+            padding: 0px; border-radius: 11px; color: {t.muted_strong};
+        }}
+        #searchClear:hover {{ background: {t.card_hover}; color: {t.text}; }}
         QToolButton {{
             color: {t.text}; background: transparent; border: none;
             border-radius: {BUTTON_RADIUS}px; padding: 4px; min-width: 28px; min-height: 28px;
@@ -214,6 +220,14 @@ def stylesheet(theme: Theme) -> str:
         #segment QPushButton:checked {{
             background: {t.card}; color: {t.text}; border: 1px solid {t.card}; border-radius: 9px;
         }}
+        #emptyTitle {{ color: {t.text}; font-size: 16px; font-weight: 700; }}
+        #emptyBody {{ color: {t.muted_strong}; }}
+        QPushButton#emptyAction {{
+            color: {t.accent_text}; background: {t.accent}; border: 1px solid {t.accent};
+            border-radius: 12px; padding: 5px 16px; font-weight: 600;
+        }}
+        QPushButton#emptyAction:hover {{ background: {t.accent_gradient_end}; border-color: {t.accent_gradient_end}; }}
+        QPushButton#emptyActionPlain {{ border-radius: 12px; padding: 5px 16px; }}
         #tint1 {{ background: {t.tint1}; border-radius: {CARD_RADIUS}px; }}
         #tint2 {{ background: {t.tint2}; border-radius: {CARD_RADIUS}px; }}
         #tint3 {{ background: {t.tint3}; border-radius: {CARD_RADIUS}px; }}
@@ -262,6 +276,9 @@ def stylesheet(theme: Theme) -> str:
         QScrollBar:horizontal {{ background: transparent; height: 6px; margin: 0px; }}
         QScrollBar::handle:horizontal {{ background: {t.border}; border-radius: 3px; }}
         QScrollBar::add-line, QScrollBar::sub-line {{ width: 0px; height: 0px; }}
+        /* Without this the track around the handle is drawn as a grey checkerboard
+           on the real Windows platform (seen at 125% to 200%, 2026-11-26). */
+        QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
         QMenu {{
             background: {t.card}; color: {t.text}; border: 1px solid {t.border};
             border-radius: {BUTTON_RADIUS}px; padding: 4px;

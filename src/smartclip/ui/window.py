@@ -130,6 +130,8 @@ from smartclip.labels import Label, SecretState
 from smartclip.storage import StoredItem
 from smartclip.ui import theme as themes
 from smartclip.ui.confirm import ask_confirm
+from smartclip.ui.empty_view import EmptyView
+from smartclip.ui.geometry import fit_size, keep_on_screen, restore_position
 
 try:  # Insights is a local-only extra (gitignored): the app runs fine without the file.
     from smartclip.ui.insights import InsightsView, compute_insights
@@ -144,6 +146,10 @@ from smartclip.ui.view_model import (
     LABEL_BADGES,
     QUICK_PASTE_COUNT,
     STATE_BADGES,
+    ACTION_CLEAR_FILTER,
+    ACTION_CLEAR_SEARCH,
+    ACTION_RESUME,
+    EMPTY_PAUSED,
     Badge,
     Filter,
     Header,
@@ -156,6 +162,7 @@ from smartclip.ui.view_model import (
     build_rows,
     countdown_level,
     countdown_text,
+    empty_state,
     filter_name,
 )
 
@@ -175,8 +182,6 @@ UNDO_TEXT = "Undo"
 PAUSED_TEXT = "Paused: nothing is being saved"
 COPIED_TEXT = "Copied. Press Ctrl+V to paste."
 CLEAR_TOOLTIP = "Delete the items shown (pinned items are kept)"
-EMPTY_TEXT = "Nothing here yet. Copy some text and it will show up here."
-NO_MATCH_TEXT = "No matching items."
 REVEAL_HINT = "Click to reveal"
 HIDE_HINT = "Click to hide"
 
@@ -188,6 +193,7 @@ _OUTER_X, _OUTER_Y, _PAD, _GAP, _BADGE_PAD_X = 8, 6, 12, 8, 7
 _ICON_FONTS = ["Segoe Fluent Icons", "Segoe MDL2 Assets"]
 _GLYPH_PAUSE, _GLYPH_PLAY, _GLYPH_MORE, _GLYPH_PIN = "", "", "", ""
 _GLYPH_VIEW, _GLYPH_HIDE, _GLYPH_DELETE = "", "", ""
+_GLYPH_CLEAR = ""  # the x in the search box
 _GLYPH_SETTINGS = ""  # the gear
 _GLYPH_DOWN, _GLYPH_UP = "", ""  # the handle's chevrons
 _NO_LIMIT = 16777215  # Qt's "no maximum height"
@@ -572,7 +578,15 @@ def card_rects(
 
 
 def show_label_badge(row: Row) -> bool:
-    """False for a "possible secret" label next to a Secret or Review? badge (same news)."""
+    """False when the state badge already says it all.
+
+    A Secret card shows only "Secret", whatever the item was before (a link
+    marked secret is no longer shown as "Link": owner's report, 2026-11-26).
+    A "possible secret" label next to Review? is the same news too. A Review?
+    card keeps its type badge, which helps to judge it.
+    """
+    if row.state is SecretState.SECRET:
+        return False
     return not (row.label is Label.POSSIBLE_SECRET and row.state_badge is not None)
 
 
@@ -1285,6 +1299,9 @@ def present_filters(items: list[StoredItem]) -> list[Filter]:
 class SearchWindow(QWidget):
     """The window opened by Ctrl+Alt+V."""
 
+    # Emitted after capture is paused or resumed from the window, a hotkey or the tray.
+    pause_changed = Signal(bool)
+
     def __init__(
         self,
         backend: WindowBackend,
@@ -1300,6 +1317,7 @@ class SearchWindow(QWidget):
         ask_text: Callable[[QWidget, str, str, str, int], str | None] = _ask_text,
     ) -> None:
         super().__init__()
+        self._built = False  # event filters ignore events until the window is fully built
         self._backend = backend
         # The top bar (search, filters, pause, settings): folded or open when the
         # window opens. The app passes False; tests default to open.
@@ -1333,6 +1351,15 @@ class SearchWindow(QWidget):
         self._expanded: set[int] = set()
         self._corners_rounded = False
         self._panel_opened_at = float("-inf")
+        # Where the window can go: both are replaced by fake ones in tests.
+        self.screen_areas: Callable[[], list[QRect]] = lambda: [
+            screen.availableGeometry()
+            for screen in sorted(QGuiApplication.screens(), key=lambda s: s is not QGuiApplication.primaryScreen())
+        ]  # the main screen first
+        self.pointer_pos: Callable[[], QPoint] = QCursor.pos
+        # A drag of the top handle in progress: (pointer at start, window at start, panel at start).
+        self._window_drag: tuple[QPoint, QPoint, QPoint | None] | None = None
+        self._window_dragged = False
 
         self.setWindowTitle("Smart Clipboard")
         self.setWindowFlags(
@@ -1348,7 +1375,8 @@ class SearchWindow(QWidget):
         self.search.setObjectName("search")
         self.search.setPlaceholderText("Search")
         self.search.setAccessibleName("Search clipboard history")
-        self.search.setClearButtonEnabled(True)
+        # Qt's own clear button sat too low with our rounded box and thick bottom
+        # line (seen 2026-11-26), so the x is our own button, placed by hand below.
         self.search.textChanged.connect(self.refresh)
         self.search.textChanged.connect(lambda _text: self._back_to_history())
         self.search.installEventFilter(self)
@@ -1402,6 +1430,16 @@ class SearchWindow(QWidget):
         self._drag_start: tuple[float, int] | None = None
         self._dragging = False
         self.chips_scroll = chips_scroll
+        self.search_clear = QToolButton(self.search)
+        self.search_clear.setObjectName("searchClear")
+        self.search_clear.setFont(icon_font)
+        self.search_clear.setText(_GLYPH_CLEAR)
+        self.search_clear.setToolTip("Clear search")
+        self.search_clear.setAccessibleName("Clear search")
+        self.search_clear.setCursor(Qt.CursorShape.ArrowCursor)
+        self.search_clear.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.search_clear.clicked.connect(self._clear_search_clicked)
+        self.search_clear.hide()
         chips_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.fade_left = EdgeFade(chips_scroll, right=False)
         self.fade_right = EdgeFade(chips_scroll, right=True)
@@ -1440,10 +1478,9 @@ class SearchWindow(QWidget):
         self.list.customContextMenuRequested.connect(self._on_context_menu)
         self.delegate.region_clicked.connect(self._on_region_clicked)
 
-        self.empty_label = QLabel(EMPTY_TEXT)
-        self.empty_label.setObjectName("muted")
-        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.empty_label.setWordWrap(True)
+        # The designed empty screens (no history, no match, paused, secrets only).
+        self.empty_view = EmptyView()
+        self.empty_view.action_triggered.connect(self._on_empty_action)
         self.status_label = QLabel()
         self.status_label.setObjectName("status")
         self.status_label.setWordWrap(True)
@@ -1469,7 +1506,7 @@ class SearchWindow(QWidget):
         history_layout.setSpacing(6)
         history_layout.addWidget(self.pause_banner)
         history_layout.addWidget(self.list, 1)
-        history_layout.addWidget(self.empty_label, 1)
+        history_layout.addWidget(self.empty_view, 1)
         self.insights_view = InsightsView() if InsightsView is not None else None
         self.pages = QStackedWidget()
         self.pages.addWidget(self.history_page)
@@ -1501,9 +1538,10 @@ class SearchWindow(QWidget):
         self.handle.setObjectName("handle")
         self.handle.setFont(icon_font)
         self.handle.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.handle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.handle.setCursor(Qt.CursorShape.OpenHandCursor)  # a click folds; a drag moves the window
         self.handle.setFixedHeight(18)
         self.handle.clicked.connect(self.toggle_drawer)
+        self.handle.installEventFilter(self)
         self.drawer = QWidget()
         drawer_layout = QVBoxLayout(self.drawer)
         drawer_layout.setContentsMargins(0, 0, 0, 0)
@@ -1547,6 +1585,7 @@ class SearchWindow(QWidget):
         self.apply_theme()
         self.set_drawer(self._start_open, animate=False)
         self.refresh()
+        self._built = True
 
     # --- Showing and hiding ---
 
@@ -1566,7 +1605,7 @@ class SearchWindow(QWidget):
         self.apply_theme()
         self.set_drawer(self._start_open, animate=False)
         self.refresh()
-        self.move_near_pointer()
+        self.place_on_open()
         self.show()
         self.raise_()
         self.activateWindow()
@@ -1606,7 +1645,7 @@ class SearchWindow(QWidget):
         self._drawer_open = open_
         self.handle.setText(_GLYPH_UP if open_ else _GLYPH_DOWN)
         label = "Hide search, filters and settings" if open_ else "Show search, filters and settings"
-        self.handle.setToolTip(label)
+        self.handle.setToolTip(f"{label}. Drag to move the window.")
         self.handle.setAccessibleName(label)
         self._place_drawer(animate and changed)
         if cleared:
@@ -1667,11 +1706,86 @@ class SearchWindow(QWidget):
         self.fade_left.raise_()
         self.fade_right.raise_()
 
+    def remembers_position(self) -> bool:
+        """True if the owner chose "Where I left it" in the settings."""
+        return self.settings_panel is not None and self.settings_panel.settings.window_position == "remembered"
+
+    def place_on_open(self) -> None:
+        """Put the window where the owner's setting says: where it was left, or by the pointer.
+
+        "Where I left it" uses the two saved numbers if they are on a screen
+        that is connected now (clamped to it); with none saved, or after a
+        monitor was unplugged, it opens next to the pointer like the default.
+        """
+        if self.remembers_position():
+            spot = self.settings_panel.settings.window_spot
+            found = restore_position(QPoint(*spot) if spot else None, WINDOW_SIZE, self.screen_areas())
+            if found is not None:
+                point, area = found
+                self.resize(fit_size(WINDOW_SIZE, area))
+                self.move(keep_on_screen(point, self.size(), area))
+                return
+        self.move_near_pointer()
+
     def move_near_pointer(self) -> None:
-        pointer = QCursor.pos()
-        screen = QGuiApplication.screenAt(pointer) or QGuiApplication.primaryScreen()
-        if screen is not None:
-            self.move(place_near(pointer, self.size(), screen.availableGeometry()))
+        pointer = self.pointer_pos()
+        areas = self.screen_areas()
+        area = next((a for a in areas if a.contains(pointer)), areas[0] if areas else None)
+        if area is not None:
+            # A short screen (200% scaling on 1080p is 540 logical pixels high)
+            # gets a shorter window instead of one that runs off the screen.
+            self.resize(fit_size(WINDOW_SIZE, area))
+            self.move(place_near(pointer, self.size(), area))
+
+    def _drag_window(self, event: QEvent) -> bool:
+        """Move the window by dragging the top handle. True if `event` was used up.
+
+        A press and release without movement stays a click (it folds or opens
+        the top bar). The window is kept inside the screen under the pointer,
+        and the settings panel, if open, moves with it. When the owner chose
+        "Where I left it", the final spot is saved (two numbers).
+        """
+        kind = event.type()
+        button = getattr(event, "button", lambda: None)()
+        if kind == QEvent.Type.MouseButtonPress and button == Qt.MouseButton.LeftButton:
+            panel = self.settings_panel
+            panel_at = panel.pos() if panel is not None and panel.isVisible() else None
+            self._window_drag = (event.globalPosition().toPoint(), self.pos(), panel_at)  # type: ignore[attr-defined]
+            self._window_dragged = False
+            return False
+        if self._window_drag is None:
+            return False
+        start, window_at, panel_at = self._window_drag
+        if kind == QEvent.Type.MouseMove:
+            here = event.globalPosition().toPoint()  # type: ignore[attr-defined]
+            delta = here - start
+            if not self._window_dragged and delta.manhattanLength() < 5:
+                return False
+            if not self._window_dragged:
+                self._window_dragged = True
+                self.handle.setCursor(Qt.CursorShape.ClosedHandCursor)
+            areas = self.screen_areas()
+            # The screen under the pointer; if it is in a gap between screens, the
+            # screen the window is on now (never "no screen": it must stay reachable).
+            area = next(
+                (a for a in areas if a.contains(here)),
+                next((a for a in areas if a.contains(self.geometry().center())), areas[0] if areas else None),
+            )
+            target = window_at + delta
+            self.move(keep_on_screen(target, self.size(), area) if area else target)
+            if panel_at is not None and self.settings_panel is not None:
+                self.settings_panel.move(panel_at + (self.pos() - window_at))
+            return True
+        if kind == QEvent.Type.MouseButtonRelease:
+            dragged, self._window_drag, self._window_dragged = self._window_dragged, None, False
+            self.handle.setCursor(Qt.CursorShape.OpenHandCursor)
+            if not dragged:
+                return False  # a plain click: the handle folds or opens the bar
+            self.handle.setDown(False)
+            if self.remembers_position():
+                self.settings_panel.remember_position(self.x(), self.y())
+            return True
+        return False
 
     def showEvent(self, event: QEvent) -> None:  # noqa: N802 (Qt name)
         self._ticks = 0
@@ -1804,11 +1918,18 @@ class SearchWindow(QWidget):
         if target is not None:
             self.list.setCurrentIndex(self.model.index(target))
         self.list.setVisible(bool(rows))
-        self.empty_label.setVisible(not rows)
-        self.empty_label.setText(EMPTY_TEXT if not items else NO_MATCH_TEXT)
-        self._update_chips(items)
         paused = self._backend.is_paused()
-        self.pause_banner.setVisible(paused)
+        self.empty_view.setVisible(not rows)
+        empty = None
+        if not rows:
+            empty = empty_state(items, self.search.text(), self._filter, paused)
+            self.empty_view.show_state(empty, self.delegate.theme)
+        # Shown only while there is text (checked here, because the search box is
+        # sometimes cleared with its signals blocked, e.g. when the window opens).
+        self.search_clear.setVisible(bool(self.search.text()))
+        self._update_chips(items)
+        # A paused empty screen carries its own Resume button, so no banner above it.
+        self.pause_banner.setVisible(paused and (empty is None or empty.kind != EMPTY_PAUSED))
         self.pause_button.setProperty("active", paused)  # drawn highlighted while paused
         self.pause_button.style().unpolish(self.pause_button)
         self.pause_button.style().polish(self.pause_button)
@@ -1820,6 +1941,29 @@ class SearchWindow(QWidget):
         clearable = bool(self.clearable_rows())
         self.clear_button.setEnabled(clearable)
         self.sync_settings_panel()
+
+    def _clear_search_clicked(self) -> None:
+        self.search.clear()
+        self.search.setFocus()
+
+    def _place_search_clear(self) -> None:
+        """Put the x at the right end of the search box, centred above its bottom line."""
+        size = self.search_clear.sizeHint()
+        box = self.search.rect()
+        y = (box.height() - size.height()) // 2 + 1  # the glyph sits a little high in its box
+        self.search_clear.move(box.width() - size.width() - 6, max(0, y))
+
+    def _on_empty_action(self, action: str) -> None:
+        """A button on an empty screen: resume capture, or clear the search or the filter."""
+        if action == ACTION_RESUME:
+            if self._backend.is_paused():
+                self.toggle_pause()
+        elif action == ACTION_CLEAR_SEARCH:
+            self.search.clear()  # the text change refreshes the list
+            self.focus_keys()
+        elif action == ACTION_CLEAR_FILTER:
+            self.set_filter(None)
+            self.focus_keys()
 
     def clearable_rows(self) -> list[Row]:
         """What Clear all would delete: the cards shown now, except pinned ones."""
@@ -2244,8 +2388,9 @@ class SearchWindow(QWidget):
             self.delete(row)
 
     def toggle_pause(self) -> None:
-        self._backend.toggle_pause()
+        paused = self._backend.toggle_pause()
         self.refresh()
+        self.pause_changed.emit(bool(paused))
 
     # --- Keys ---
 
@@ -2320,6 +2465,8 @@ class SearchWindow(QWidget):
         return False
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802 (Qt name)
+        if not self._built:
+            return False  # building the window sends events to parts that are not made yet
         if watched is self.chips_scroll.viewport() and event.type() == QEvent.Type.Resize:
             self.update_chip_fades()
         if watched is self.chips_scroll.viewport() and event.type() == QEvent.Type.Wheel:
@@ -2329,8 +2476,12 @@ class SearchWindow(QWidget):
             bar = self.chips_scroll.horizontalScrollBar()
             bar.setValue(bar.value() - step)
             return True
+        if watched is self.handle and self._drag_window(event):
+            return True
         if self._drag_scroll(watched, event):
             return True
+        if watched is self.search and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            self._place_search_clear()
         if watched is self.search and event.type() == QEvent.Type.KeyPress:
             key = event.key()  # type: ignore[attr-defined]
             if self._quick_key(event) or self._navigate(key):

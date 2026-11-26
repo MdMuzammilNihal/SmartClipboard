@@ -11,7 +11,7 @@ focus, and Esc or Close shuts it.
 
 from collections.abc import Callable
 
-from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -29,7 +29,10 @@ from PySide6.QtWidgets import (
 
 from smartclip import config
 from smartclip.ui import theme as themes
+from smartclip.ui.geometry import centre_over, fit_size
 from smartclip.ui.view_model import QUICK_PASTE_COUNT
+
+SHORTCUTS_SIZE = QSize(360, 480)  # logical pixels; shortened on a short screen
 
 
 def shortcut_groups() -> list[tuple[str, list[tuple[str, str]]]]:
@@ -167,14 +170,17 @@ class ShortcutsDialog(QDialog):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(card)
-        self.setFixedSize(360, 480)
+        self.setFixedSize(SHORTCUTS_SIZE)
 
     def showEvent(self, event: QEvent) -> None:  # noqa: N802 (Qt name)
         super().showEvent(event)
         parent = self.parentWidget()
-        if parent is not None:  # centred over the settings panel
-            centre = parent.geometry().center()
-            self.move(centre.x() - self.width() // 2, centre.y() - self.height() // 2)
+        screen = (parent.screen() if parent is not None else None) or self.screen()
+        area = screen.availableGeometry() if screen else None
+        if area is not None:  # a short screen (200% scaling on 1080p) gets a shorter list
+            self.setFixedHeight(fit_size(QSize(SHORTCUTS_SIZE.width(), SHORTCUTS_SIZE.height()), area).height())
+        if parent is not None:  # centred over the settings panel, kept on its screen
+            self.move(centre_over(parent.geometry(), self.size(), area or parent.geometry()))
         QTimer.singleShot(0, self.raise_)
         QTimer.singleShot(0, self.activateWindow)
 

@@ -25,8 +25,6 @@ from smartclip.storage import ItemPayload, StoredItem  # noqa: E402
 from smartclip.ui import theme  # noqa: E402
 from smartclip.ui.view_model import MASK, Row  # noqa: E402
 from smartclip.ui.window import (  # noqa: E402
-    EMPTY_TEXT,
-    NO_MATCH_TEXT,
     REGION_CARD,
     REGION_DELETE,
     REGION_LABEL,
@@ -247,14 +245,14 @@ def test_empty_history_shows_a_hint(qapp: QApplication, backend: FakeBackend) ->
     backend.store.clear()
     win = SearchWindow(backend)
     win.show_and_focus()
-    assert win.empty_label.isVisible() and win.empty_label.text() == EMPTY_TEXT
+    assert win.empty_view.isVisible() and win.empty_view.title_label.text() == "Nothing copied yet"
     assert not win.list.isVisible()
     win.hide()
 
 
 def test_no_match_shows_a_different_hint(window: SearchWindow) -> None:
     window.search.setText("nothing-matches-this")
-    assert window.empty_label.text() == NO_MATCH_TEXT and window.empty_label.isVisible()
+    assert window.empty_view.title_label.text() == "No matches" and window.empty_view.isVisible()
 
 
 # --- Search and filters ---
@@ -578,8 +576,8 @@ def test_click_regions_of_a_card(qapp: QApplication) -> None:
 
     metrics = QFontMetrics(QFont())
     row = make_row(
-        label=Label.JSON, label_badge=row_badge(Label.JSON), state=SecretState.SECRET,
-        state_badge=STATE_BADGES[SecretState.SECRET], preview=MASK, masked=True, can_pin=False,
+        label=Label.JSON, label_badge=row_badge(Label.JSON), state=SecretState.UNSURE,
+        state_badge=STATE_BADGES[SecretState.UNSURE], preview=MASK, masked=True, can_pin=False,
     )
     rects = card_rects(QRect(0, 0, 360, 100), row, metrics)
     assert rects.label is not None and rects.state is not None and rects.text is not None
@@ -1117,3 +1115,41 @@ def test_shortcuts_dialog_shows_names_and_closes_with_escape(qapp: QApplication)
 def test_no_possible_secret_chip_beside_the_secret_and_review_chips(window: SearchWindow) -> None:
     assert Label.POSSIBLE_SECRET not in window.chips
     assert SecretState.SECRET in window.chips and SecretState.UNSURE in window.chips
+
+
+def test_a_link_marked_secret_shows_only_the_secret_badge(window: SearchWindow, backend: FakeBackend) -> None:
+    window.mark_secret(next(r for r in window.model.rows if r.item_id == 2))  # the fake link
+    row = next(r for r in window.model.rows if r.item_id == 2)
+    assert row.label is Label.LINK and row.state is SecretState.SECRET
+    assert not show_label_badge(row)
+    rects = card_rects(QRect(0, 0, 360, 100), row, QFontMetrics(QFont()))
+    assert rects.label is None and rects.state is not None
+
+
+def test_review_cards_keep_their_type_badge() -> None:
+    from smartclip.ui.view_model import STATE_BADGES
+
+    unsure = make_row(state=SecretState.UNSURE, state_badge=STATE_BADGES[SecretState.UNSURE])
+    assert show_label_badge(unsure)
+
+
+def test_search_clear_button_shows_only_with_text_and_clears(window: SearchWindow) -> None:
+    from PySide6.QtCore import QRect
+
+    assert not window.search_clear.isVisible()
+    window.search.setText("fake")
+    assert window.search_clear.isVisible()
+    box = QRect(0, 0, window.search.width(), window.search.height())
+    assert box.contains(QRect(window.search_clear.pos(), window.search_clear.size()))
+    # Centred up and down (within a pixel or two) in the box, and clear of the right edge.
+    middle = window.search_clear.y() + window.search_clear.height() / 2
+    assert abs(middle - window.search.height() / 2) <= 3
+    window.search_clear.click()
+    assert window.search.text() == "" and not window.search_clear.isVisible()
+
+
+def test_search_clear_button_is_gone_after_the_window_reopens(window: SearchWindow) -> None:
+    window.search.setText("fake")
+    window.hide()
+    window.show_and_focus()  # clears the text with signals blocked
+    assert window.search.text() == "" and not window.search_clear.isVisible()

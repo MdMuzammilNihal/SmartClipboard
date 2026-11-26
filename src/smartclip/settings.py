@@ -9,8 +9,13 @@ config.py.
 Owner's decisions (2026-11-24): the window keeps following the Windows light
 or dark setting, so there is no theme choice here.
 
+Window position (owner's decisions, 2026-11-26): "Window opens" is either
+next to the pointer (the default) or where the owner last left it. The
+remembered spot is two whole numbers (the window's top-left corner on the
+desktop) and is only written after the owner drags the window.
+
 SECURITY REVIEW (owner): the file holds numbers, true/false values, a font
-choice and the exclusion list, which is executable names such as
+choice, the window's two position numbers and the exclusion list, which is executable names such as
 "keepass.exe" and nothing else. It never holds clipboard content, item ids or
 window titles. The names are configuration, not clipboard content, but they
 say which apps you use, so the file is not meant to be shared. It is not
@@ -36,6 +41,8 @@ SECRET_HOURS_RANGE = (1, 24)
 _LEGACY_MINUTES_RANGE = (5, 1440)  # the first version of the file stored minutes
 MAX_EXCLUDED_APPS = 50
 FONT_CHOICES = ("plex", "system")
+POSITION_CHOICES = ("pointer", "remembered")  # where the window opens
+COORDINATE_RANGE = (-100_000, 100_000)  # far beyond any real desktop; refuses nonsense
 # A plain Windows executable name: letters, digits, spaces and . _ - ( ) only.
 _EXE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9 ._()\-]{0,62}\.exe$")
 
@@ -62,6 +69,16 @@ class Settings:
     excluded_apps: tuple[str, ...] = ()
     pause_on_start: bool = False
     font: str = "plex"
+    window_position: str = "pointer"
+    window_x: int | None = None
+    window_y: int | None = None
+
+    @property
+    def window_spot(self) -> tuple[int, int] | None:
+        """The remembered top-left corner, or None if there is none."""
+        if self.window_x is None or self.window_y is None:
+            return None
+        return self.window_x, self.window_y
 
     @property
     def normal_retention(self) -> timedelta:
@@ -111,6 +128,11 @@ def from_raw(raw: object) -> Settings:
         values["pause_on_start"] = raw["pause_on_start"]
     if raw.get("font") in FONT_CHOICES:
         values["font"] = raw["font"]
+    if raw.get("window_position") in POSITION_CHOICES:
+        values["window_position"] = raw["window_position"]
+    # Both numbers or neither: half a position is not a position.
+    if _in_range(raw.get("window_x"), COORDINATE_RANGE) and _in_range(raw.get("window_y"), COORDINATE_RANGE):
+        values["window_x"], values["window_y"] = raw["window_x"], raw["window_y"]
     return Settings(**values)
 
 

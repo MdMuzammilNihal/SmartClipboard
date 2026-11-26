@@ -138,7 +138,7 @@ def apply_settings(
 
 
 ALREADY_RUNNING_MESSAGE = (
-    "Smart Clipboard is already running. Press Ctrl+Alt+V to open its window."
+    "Smart Clipboard is already running. Press Ctrl+Alt+V or click its tray icon to open its window."
 )
 
 
@@ -422,6 +422,7 @@ def main() -> int:
     from smartclip.ui import capture_guard, typeface
     from smartclip.ui.paste import Paster
     from smartclip.ui.settings_dialog import SettingsPanel
+    from smartclip.ui.tray import TrayIcon
     from smartclip.ui.window import SearchWindow
     from smartclip.winhistory import HistoryCleaner
 
@@ -542,6 +543,19 @@ def main() -> int:
     if taken:
         window.status_label.setText("Hotkeys in use by another app: " + ", ".join(taken))
 
+    # The notification-area icon (UI plan M3). Its pause entry goes through the
+    # window so the window, the hotkey and the tray always agree.
+    tray = TrayIcon(
+        is_paused=backend.is_paused,
+        open_window=window.show_and_focus,
+        toggle_pause=window.toggle_pause,
+        quit_app=backend.quit,
+    )
+    window.pause_changed.connect(tray.sync)
+    tray_shown = tray.start()
+    if taken and tray_shown:
+        tray.show_hotkey_clash(taken)  # also visible when started hidden at login
+
     def poll_events() -> None:
         if backend.drain(events) and window.isVisible():
             window.refresh()
@@ -560,17 +574,19 @@ def main() -> int:
 
     # Started by hand, the window opens so it is clear the app runs. Started
     # at login (autostart.py passes --background), it stays hidden until
-    # Ctrl+Alt+V. With no tray icon yet, a hotkey clash is then only shown
-    # when the window is opened.
+    # Ctrl+Alt+V or a click on the tray icon.
     background = BACKGROUND_FLAG in sys.argv[1:]
     if not background:
         window.show_and_focus()
-    logsafe.log_event(_log, "app_started", hotkeys_taken=len(taken), background=background)
+    logsafe.log_event(
+        _log, "app_started", hotkeys_taken=len(taken), background=background, tray=tray_shown
+    )
     try:
         return qt_app.exec()
     finally:
         event_timer.stop()
         cleanup_timer.stop()
+        tray.stop()
         hotkeys.stop()
         # Stopping the listener also clears a pending secret copy-back.
         listener.stop()

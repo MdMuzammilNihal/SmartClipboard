@@ -271,6 +271,96 @@ def filter_name(active: Filter) -> str:
     return STATE_BADGES[active].text
 
 
+# --- Empty states (UI plan M3) ---
+#
+# What the window says when the list has no cards. Fixed wording only: it
+# never repeats the search text or any item's text (a search could be a
+# pasted secret), and the type or tag names come from the filter chips.
+
+EMPTY_NO_HISTORY = "no_history"
+EMPTY_NO_MATCH = "no_match"
+EMPTY_PAUSED = "paused"
+EMPTY_SECRETS_ONLY = "secrets_only"
+
+ACTION_RESUME = "resume"
+ACTION_CLEAR_SEARCH = "clear_search"
+ACTION_CLEAR_FILTER = "clear_filter"
+ACTION_LABELS = {
+    ACTION_RESUME: "Resume capture",
+    ACTION_CLEAR_SEARCH: "Clear search",
+    ACTION_CLEAR_FILTER: "Show all",
+}
+
+
+@dataclass(frozen=True)
+class EmptyState:
+    """One designed empty screen: which one, its words, and the buttons (ACTION_* ids)."""
+
+    kind: str
+    title: str
+    body: str
+    actions: tuple[str, ...] = ()
+
+
+def empty_state(
+    items: list[StoredItem],
+    search: str,
+    active: Filter | None,
+    paused: bool,
+    open_hotkey: str = config.HOTKEY_OPEN_WINDOW,
+) -> EmptyState:
+    """Choose the empty screen for a list with no cards.
+
+    A search or filter that finds nothing comes first (the pause banner above
+    already says capture is off). When secrets are the reason (search leaves
+    them out on purpose) say so. Then a paused capture, then a first run.
+    """
+    searching = bool(search.strip())
+    if searching:
+        sensitive_filter = isinstance(active, SecretState) and active is not SecretState.NORMAL
+        everything_sensitive = bool(items) and all(retention.is_sensitive(i.payload) for i in items)
+        if sensitive_filter or everything_sensitive:
+            return EmptyState(
+                EMPTY_SECRETS_ONLY,
+                "Secrets are not searched",
+                "Items marked Secret or Review? are left out of search on purpose. "
+                "Clear the search to see them, still masked.",
+                (ACTION_CLEAR_SEARCH,),
+            )
+    if searching and active is not None:
+        return EmptyState(
+            EMPTY_NO_MATCH,
+            "No matches",
+            f"Nothing in {filter_name(active)} matches this search.",
+            (ACTION_CLEAR_SEARCH, ACTION_CLEAR_FILTER),
+        )
+    if searching:
+        return EmptyState(
+            EMPTY_NO_MATCH, "No matches", "Nothing in your history matches this search.",
+            (ACTION_CLEAR_SEARCH,),
+        )
+    if active is not None:
+        return EmptyState(
+            EMPTY_NO_MATCH,
+            f"No {filter_name(active)} items",
+            "Nothing in your history fits this filter right now.",
+            (ACTION_CLEAR_FILTER,),
+        )
+    if paused:
+        return EmptyState(
+            EMPTY_PAUSED,
+            "Capture is paused",
+            "Nothing you copy is being saved. Resume to start collecting again.",
+            (ACTION_RESUME,),
+        )
+    return EmptyState(
+        EMPTY_NO_HISTORY,
+        "Nothing copied yet",
+        f"Copy some text and it will show up here. Press {open_hotkey} to open "
+        "this window any time, or click the tray icon.",
+    )
+
+
 # --- Day groups (UI plan item 2) ---
 
 GROUP_PINNED = "PINNED"
